@@ -92,8 +92,10 @@ export function downloadBlob(blob, filename) {
 
 export async function downloadAllSequentially(items, delayMs = 400) {
   for (const item of items) {
-    if (!item.pdfBlob) continue;
-    downloadBlob(item.pdfBlob, item.customName);
+    const blob = item.blob ?? item.pdfBlob;
+    const name = item.name ?? item.customName;
+    if (!blob) continue;
+    downloadBlob(blob, name);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
