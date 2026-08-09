@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <title>Test Rapikan — 5 Gambar User</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1rem; background: #1a1a2e; color: #fff; }
+    h1 { font-size: 1.2rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .card { background: #fff; color: #111; border-radius: 12px; padding: 0.75rem; }
+    .card h2 { font-size: 0.85rem; margin: 0 0 0.5rem; }
+    .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+    .pair figcaption { font-size: 0.7rem; text-align: center; color: #555; }
+    img { width: 100%; border: 1px solid #ddd; border-radius: 6px; background: #eee; }
+    .status { margin: 1rem 0; font-weight: 600; }
+    .ok { color: #34d399; }
+    .fail { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>Test Rapikan — 5 gambar WhatsApp user</h1>
+  <p id="status" class="status">Memproses...</p>
+  <div id="grid" class="grid"></div>
+  <script type="module">
+    import { autoScanDocument, buildProcessedImage, getImageDimensions, isRapikanDone } from '/src/utils/imageProcessing.js';
+
+    const files = [
+      { name: 'Kartu Bimbingan TA', path: '/test-user/01-bimbingan.png' },
+      { name: 'Setoran Tunai (biru)', path: '/test-user/02-setoran-tunai.png' },
+      { name: 'KRS (lantai)', path: '/test-user/03-krs-lantai.png' },
+      { name: 'Pernyataan Keaslian', path: '/test-user/04-pernyataan.png' },
+      { name: 'KRS (kayu)', path: '/test-user/05-krs-kayu.png' },
+    ];
+
+    const status = document.getElementById('status');
+    const grid = document.getElementById('grid');
+    let okCount = 0;
+
+    for (const file of files) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `<h2>${file.name}</h2><div class="pair"><figure><img id="orig-${file.path}" alt="Asli" /><figcaption>Asli</figcaption></figure><figure><img id="out-${file.path}" alt="Hasil" /><figcaption>Hasil Rapikan</figcaption></figure></div><p class="meta"></p>`;
+      grid.appendChild(card);
+
+      try {
+        const res = await fetch(file.path);
+        const blob = await res.blob();
+        const dataUrl = await new Promise((r) => {
+          const reader = new FileReader();
+          reader.onload = () => r(reader.result);
+          reader.readAsDataURL(blob);
+        });
+
+        document.getElementById(`orig-${file.path}`).src = dataUrl;
+        const orig = await getImageDimensions(dataUrl);
+        const scanned = await autoScanDocument(dataUrl, true);
+        const item = { originalDataUrl: dataUrl, ...scanned };
+        const ok = isRapikanDone(item);
+
+        if (ok) {
+          const { dataUrl: outUrl } = await buildProcessedImage(item, scanned.cropRect, false);
+          document.getElementById(`out-${file.path}`).src = outUrl;
+          const out = await getImageDimensions(outUrl);
+          card.querySelector('.meta').textContent = `OK — ${orig.width}×${orig.height} → ${out.width}×${out.height}`;
+          card.querySelector('.meta').style.color = '#059669';
+          okCount++;
+        } else {
+          document.getElementById(`out-${file.path}`).src = dataUrl;
+          card.querySelector('.meta').textContent = 'GAGAL — perlu edit manual';
+          card.querySelector('.meta').style.color = '#dc2626';
+        }
+      } catch (e) {
+        card.querySelector('.meta').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    status.textContent = `Selesai: ${okCount}/${files.length} berhasil dirapikan`;
+    status.className = 'status ' + (okCount === files.length ? 'ok' : 'fail');
+  </script>
+</body>
+</html>

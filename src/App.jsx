@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import GroupNameModal from './components/GroupNameModal';
+import GroupPreviewPanel from './components/GroupPreviewPanel';
 import ImagePreviewModal from './components/ImagePreviewModal';
 import {
   convertMergedImages,
@@ -17,7 +17,7 @@ import {
   isSeparateConvertComplete,
   removeImageFromGroups,
 } from './utils/groupHelpers';
-import { buildProcessedImage, processUploadedImage } from './utils/imageProcessing';
+import { buildProcessedImage, processUploadedImage, rapikanImage, fullCropRect, getImageDimensions, isRapikanDone } from './utils/imageProcessing';
 import './App.css';
 
 function createId() {
@@ -30,7 +30,7 @@ function App() {
   const [images, setImages] = useState([]);
   const [groups, setGroups] = useState([]);
   const [selectedIds, setSelectedIds] = useState([]);
-  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [draftGroupName, setDraftGroupName] = useState('gabungan');
   const [mode, setMode] = useState('separate');
   const [mergedName, setMergedName] = useState('gabungan');
   const [mergedBlob, setMergedBlob] = useState(null);
@@ -40,6 +40,7 @@ function App() {
   const [dragOver, setDragOver] = useState(false);
   const [dragIndex, setDragIndex] = useState(null);
   const [previewId, setPreviewId] = useState(null);
+  const [previewInitialMode, setPreviewInitialMode] = useState('preview');
   const fileInputRef = useRef(null);
   const imagesRef = useRef(images);
   imagesRef.current = images;
@@ -63,7 +64,7 @@ function App() {
     if (accepted.length === 0) return;
 
     setIsProcessingUpload(true);
-    setProgress('Memproses gambar & auto-crop...');
+    setProgress('Memuat gambar...');
 
     try {
       const newItems = await Promise.all(
@@ -91,36 +92,95 @@ function App() {
 
   const updateImageProcessing = useCallback(async (id, patch) => {
     const current = imagesRef.current.find((img) => img.id === id);
-    if (!current) return;
+    if (!current) return null;
 
-    const cropRect = patch.cropRect ?? current.cropRect;
-    const enhanceEnabled = patch.enhanceEnabled ?? current.enhanceEnabled;
-    const autoCropApplied =
-      patch.autoCropApplied !== undefined ? patch.autoCropApplied : current.autoCropApplied;
+    const merged = { ...current, ...patch };
+    const cropRect = merged.cropRect;
+    const enhanceEnabled = merged.enhanceEnabled ?? false;
+    const autoCropApplied = merged.autoCropApplied ?? false;
+    const autoEnhanceApplied = merged.autoEnhanceApplied ?? false;
 
-    const { dataUrl } = await buildProcessedImage(
-      current.originalDataUrl,
-      cropRect,
-      enhanceEnabled,
-    );
+    const { dataUrl } = await buildProcessedImage(merged, cropRect, enhanceEnabled);
 
     setImages((prev) =>
       prev.map((img) =>
         img.id === id
-          ? { ...img, cropRect, enhanceEnabled, autoCropApplied, dataUrl, pdfBlob: null }
+          ? {
+              ...merged,
+              dataUrl,
+              pdfBlob: null,
+            }
           : { ...img, pdfBlob: null },
       ),
     );
     setGroups((prev) => prev.map((g) => ({ ...g, pdfBlob: null })));
     setMergedBlob(null);
+
+    return {
+      dataUrl,
+      enhanceEnabled,
+      cropRect,
+      autoCropApplied,
+      autoEnhanceApplied,
+      scanBaseDataUrl: merged.scanBaseDataUrl,
+      autoCropRect: merged.autoCropRect,
+    };
   }, []);
+
+  const handleRapikan = useCallback(
+    async (id) => {
+      const item = imagesRef.current.find((img) => img.id === id);
+      if (!item) return null;
+
+      try {
+        const tidied = await rapikanImage(item.originalDataUrl, item.enhanceEnabled ?? false);
+        const result = await updateImageProcessing(id, {
+          scanBaseDataUrl: tidied.scanBaseDataUrl,
+          cropRect: tidied.cropRect,
+          autoCropRect: tidied.autoCropRect,
+          autoCropApplied: tidied.autoCropApplied,
+          enhanceEnabled: item.enhanceEnabled ?? false,
+          autoEnhanceApplied: item.autoEnhanceApplied ?? false,
+        });
+        return result ? { ...result, rapikanFailed: !isRapikanDone({ ...item, ...result, scanBaseDataUrl: result.scanBaseDataUrl }) } : null;
+      } catch (err) {
+        console.error(err);
+        return { rapikanFailed: true, error: err.message };
+      }
+    },
+    [updateImageProcessing],
+  );
+
+  const handleResetOriginal = useCallback(
+    async (id) => {
+      const item = imagesRef.current.find((img) => img.id === id);
+      if (!item) return null;
+
+      try {
+        const dims = await getImageDimensions(item.originalDataUrl);
+        const fullRect = fullCropRect(dims.width, dims.height);
+        return updateImageProcessing(id, {
+          scanBaseDataUrl: item.originalDataUrl,
+          cropRect: fullRect,
+          autoCropRect: fullRect,
+          autoCropApplied: false,
+          enhanceEnabled: item.enhanceEnabled ?? false,
+          autoEnhanceApplied: item.autoEnhanceApplied ?? false,
+        });
+      } catch (err) {
+        console.error(err);
+        return null;
+      }
+    },
+    [updateImageProcessing],
+  );
 
   const applyImageChanges = useCallback(
     async (id, { cropRect, enhanceEnabled }) => {
       await updateImageProcessing(id, {
         cropRect,
         enhanceEnabled,
-        autoCropApplied: false,
+        autoCropApplied: true,
       });
     },
     [updateImageProcessing],
@@ -128,16 +188,100 @@ function App() {
 
   const handleToggleEnhance = useCallback(
     async (id, enabled) => {
-      const item = images.find((img) => img.id === id);
-      if (!item) return;
+      const item = imagesRef.current.find((img) => img.id === id);
+      if (!item) return null;
 
-      await updateImageProcessing(id, {
+      return updateImageProcessing(id, {
         cropRect: item.cropRect,
         enhanceEnabled: enabled,
+        autoEnhanceApplied: enabled,
       });
     },
-    [images, updateImageProcessing],
+    [updateImageProcessing],
   );
+
+  const openPreview = useCallback((id, mode = 'preview') => {
+    setPreviewInitialMode(mode);
+    setPreviewId(id);
+  }, []);
+
+  const handleRapikanSemua = useCallback(async () => {
+    const pending = imagesRef.current.filter((img) => !isRapikanDone(img));
+    if (pending.length === 0) return;
+
+    setIsProcessingUpload(true);
+    let failed = 0;
+    try {
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i];
+        setProgress(`Merapikan ${i + 1}/${pending.length}: ${item.customName}`);
+        const result = await handleRapikan(item.id);
+        if (result?.rapikanFailed) failed++;
+      }
+      setProgress(
+        failed > 0
+          ? `Selesai — ${failed} gambar perlu Edit Crop manual`
+          : `Semua gambar dirapikan (${pending.length})`,
+      );
+      await new Promise((r) => setTimeout(r, 1200));
+    } finally {
+      setIsProcessingUpload(false);
+      setProgress('');
+    }
+  }, [handleRapikan]);
+
+  const handlePerjelasSemua = useCallback(async () => {
+    const pending = imagesRef.current.filter((img) => !img.enhanceEnabled);
+    if (pending.length === 0) return;
+
+    setIsProcessingUpload(true);
+    try {
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i];
+        setProgress(`Memperjelas ${i + 1}/${pending.length}: ${item.customName}`);
+        await handleToggleEnhance(item.id, true);
+      }
+      setProgress(`Semua gambar diperjelas (${pending.length})`);
+      await new Promise((r) => setTimeout(r, 1200));
+    } finally {
+      setIsProcessingUpload(false);
+      setProgress('');
+    }
+  }, [handleToggleEnhance]);
+
+  const handleRapikanPerjelasSemua = useCallback(async () => {
+    const list = imagesRef.current;
+    if (list.length === 0) return;
+
+    setIsProcessingUpload(true);
+    let rapikanFailed = 0;
+    try {
+      const needRapikan = list.filter((img) => !isRapikanDone(img));
+      for (let i = 0; i < needRapikan.length; i++) {
+        const item = needRapikan[i];
+        setProgress(`Merapikan ${i + 1}/${needRapikan.length}: ${item.customName}`);
+        const result = await handleRapikan(item.id);
+        if (result?.rapikanFailed) rapikanFailed++;
+      }
+
+      const needPerjelas = imagesRef.current.filter((img) => !img.enhanceEnabled);
+      for (let i = 0; i < needPerjelas.length; i++) {
+        const item = needPerjelas[i];
+        setProgress(`Memperjelas ${i + 1}/${needPerjelas.length}: ${item.customName}`);
+        await handleToggleEnhance(item.id, true);
+      }
+
+      if (rapikanFailed > 0) {
+        setProgress(`${rapikanFailed} gambar perlu Edit Crop manual — sisanya selesai`);
+      } else {
+        setProgress('Semua gambar dirapikan & diperjelas');
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+    } finally {
+      setIsProcessingUpload(false);
+      setProgress('');
+    }
+  }, [handleRapikan, handleToggleEnhance]);
 
   const toggleSelect = (id) => {
     if (getGroupForImage(id, groups)) return;
@@ -147,8 +291,9 @@ function App() {
     );
   };
 
-  const handleCreateGroup = (name) => {
-    if (selectedIds.length < 2) return;
+  const handleCreateGroup = () => {
+    const name = draftGroupName.trim();
+    if (!name || selectedIds.length < 2) return;
 
     setGroups((prev) => [
       ...prev,
@@ -160,7 +305,7 @@ function App() {
       },
     ]);
     setSelectedIds([]);
-    setShowGroupModal(false);
+    setDraftGroupName(`gabungan-${groups.length + 2}`);
     clearPdfResults();
   };
 
@@ -261,8 +406,13 @@ function App() {
   };
 
   const previewItem = images.find((img) => img.id === previewId);
-  const selectableSelected = selectedIds.filter((id) => !getGroupForImage(id, groups));
-  const canCreateGroup = mode === 'separate' && selectableSelected.length >= 2;
+  const selectedImages = images.filter(
+    (img) => selectedIds.includes(img.id) && !getGroupForImage(img.id, groups),
+  );
+  const rapikanCount = images.filter((img) => isRapikanDone(img)).length;
+  const perjelasCount = images.filter((img) => img.enhanceEnabled).length;
+  const rapikanPending = images.length - rapikanCount;
+  const perjelasPending = images.length - perjelasCount;
   const allConverted =
     mode === 'separate'
       ? isSeparateConvertComplete(images, groups)
@@ -294,7 +444,7 @@ function App() {
         <div className="upload-zone__icon">📁</div>
         <p className="upload-zone__title">Tarik & lepas gambar di sini</p>
         <p className="upload-zone__hint">
-          atau ketuk untuk pilih file (PNG / JPG, auto-crop otomatis saat upload)
+          PNG / JPG · upload dulu, lalu rapikan & perjelas manual (per file atau semua sekaligus)
         </p>
         <input
           ref={fileInputRef}
@@ -361,36 +511,49 @@ function App() {
             <section className="groups-section">
               <h2>Grup PDF ({groups.length})</h2>
               <ul className="groups-list">
-                {groups.map((group) => (
-                  <li key={group.id} className="group-card">
-                    <span
-                      className="group-card__dot"
-                      style={{ background: getGroupColor(group.id) }}
-                    />
-                    <div className="group-card__info">
-                      <strong>{group.name}</strong>
-                      <span>{group.imageIds.length} gambar · urutan sesuai list</span>
-                    </div>
-                    <div className="group-card__actions">
-                      {group.pdfBlob && (
-                        <button
-                          type="button"
-                          className="btn btn--small btn--success"
-                          onClick={() => downloadBlob(group.pdfBlob, group.name)}
-                        >
-                          Download
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="btn btn--small btn--outline"
-                        onClick={() => removeGroup(group.id)}
-                      >
-                        Hapus Grup
-                      </button>
-                    </div>
-                  </li>
-                ))}
+                {groups.map((group) => {
+                  const groupImages = getGroupImagesInOrder(images, group);
+                  return (
+                    <li key={group.id} className="group-card group-card--expanded">
+                      <div className="group-card__top">
+                        <span
+                          className="group-card__dot"
+                          style={{ background: getGroupColor(group.id) }}
+                        />
+                        <div className="group-card__info">
+                          <strong>{group.name}.pdf</strong>
+                          <span>{group.imageIds.length} halaman · urutan sesuai list</span>
+                        </div>
+                        <div className="group-card__actions">
+                          {group.pdfBlob && (
+                            <button
+                              type="button"
+                              className="btn btn--small btn--success"
+                              onClick={() => downloadBlob(group.pdfBlob, group.name)}
+                            >
+                              Download
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="btn btn--small btn--outline"
+                            onClick={() => removeGroup(group.id)}
+                          >
+                            Bubarkan Grup
+                          </button>
+                        </div>
+                      </div>
+                      <div className="group-card__pages">
+                        {groupImages.map((img, index) => (
+                          <figure key={img.id} className="group-preview-page group-preview-page--small">
+                            <img src={img.dataUrl} alt={`${group.name} halaman ${index + 1}`} />
+                            <figcaption>H{index + 1}</figcaption>
+                          </figure>
+                        ))}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           )}
@@ -400,23 +563,49 @@ function App() {
               <h2>Gambar ({images.length})</h2>
               <p className="hint">
                 {mode === 'separate'
-                  ? 'Centang gambar → buat grup · ketuk thumbnail untuk preview'
-                  : 'Ketuk thumbnail untuk preview · seret item untuk urutkan'}
+                  ? 'Centang gambar → buat grup · ketuk thumbnail untuk preview · Edit untuk crop manual'
+                  : 'Ketuk thumbnail untuk preview · Edit untuk crop manual · seret item untuk urutkan'}
               </p>
             </div>
 
-            {mode === 'separate' && canCreateGroup && (
-              <div className="selection-bar">
-                <span>{selectableSelected.length} gambar dipilih</span>
+            <div className="batch-toolbar">
+              <div className="batch-toolbar__status" role="status">
+                <span className="batch-toolbar__stat batch-toolbar__stat--rapikan">
+                  Rapikan: {rapikanCount}/{images.length}
+                </span>
+                <span className="batch-toolbar__stat batch-toolbar__stat--perjelas">
+                  Perjelas: {perjelasCount}/{images.length}
+                </span>
+              </div>
+              <div className="batch-toolbar__actions">
                 <button
                   type="button"
-                  className="btn btn--small btn--primary"
-                  onClick={() => setShowGroupModal(true)}
+                  className="btn btn--small btn--outline"
+                  onClick={handleRapikanSemua}
+                  disabled={isProcessingUpload || rapikanPending === 0}
                 >
-                  Gabung Jadi 1 PDF
+                  Rapikan Semua{rapikanPending > 0 ? ` (${rapikanPending})` : ''}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--small btn--filter"
+                  onClick={handlePerjelasSemua}
+                  disabled={isProcessingUpload || perjelasPending === 0}
+                >
+                  Perjelas Semua{perjelasPending > 0 ? ` (${perjelasPending})` : ''}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--small btn--secondary"
+                  onClick={handleRapikanPerjelasSemua}
+                  disabled={
+                    isProcessingUpload || (rapikanPending === 0 && perjelasPending === 0)
+                  }
+                >
+                  Rapikan + Perjelas Semua
                 </button>
               </div>
-            )}
+            </div>
 
             <ul className="image-list">
               {images.map((item, index) => {
@@ -427,7 +616,7 @@ function App() {
                 return (
                   <li
                     key={item.id}
-                    className={`image-item ${dragIndex === index ? 'image-item--dragging' : ''} ${isSelected ? 'image-item--selected' : ''}`}
+                    className={`image-item ${dragIndex === index ? 'image-item--dragging' : ''} ${isSelected ? 'image-item--selected' : ''} ${isRapikanDone(item) ? 'image-item--rapikan' : 'image-item--raw'}`}
                     draggable
                     onDragStart={() => setDragIndex(index)}
                     onDragEnd={() => setDragIndex(null)}
@@ -459,7 +648,7 @@ function App() {
                     <button
                       type="button"
                       className="image-item__thumb-btn"
-                      onClick={() => setPreviewId(item.id)}
+                      onClick={() => openPreview(item.id, 'preview')}
                       aria-label={`Preview ${item.customName}`}
                     >
                       <img
@@ -468,15 +657,22 @@ function App() {
                         alt={item.customName}
                         draggable={false}
                       />
-                      {item.autoCropApplied && (
-                        <span className="image-item__tag">Auto-crop</span>
-                      )}
+                      <div className="image-item__tags">
+                        {isRapikanDone(item) ? (
+                          <span className="image-item__tag">Rapikan</span>
+                        ) : (
+                          <span className="image-item__tag image-item__tag--pending">Belum rapikan</span>
+                        )}
+                        {item.enhanceEnabled && (
+                          <span className="image-item__tag image-item__tag--enhance">Perjelas</span>
+                        )}
+                      </div>
                       {group && (
                         <span
                           className="image-item__tag image-item__tag--group"
                           style={{ background: getGroupColor(group.id) }}
                         >
-                          {group.name}
+                          Grup: {group.name}
                         </span>
                       )}
                     </button>
@@ -494,17 +690,18 @@ function App() {
                         disabled={!!group}
                       />
                       <span className="image-item__meta">
-                        {group ? `Grup: ${group.name}` : item.file.name}
+                        {group ? `Masuk Grup: ${group.name}` : item.file.name}
                       </span>
-                      <button
-                        type="button"
-                        className={`btn btn--tiny ${item.enhanceEnabled ? 'btn--filter-active' : 'btn--filter'}`}
-                        onClick={() => handleToggleEnhance(item.id, !item.enhanceEnabled)}
-                      >
-                        {item.enhanceEnabled ? '✓ Perjelas' : 'Perjelas Gambar'}
-                      </button>
                     </div>
                     <div className="image-item__actions">
+                      <button
+                        type="button"
+                        className="btn btn--small btn--outline btn--tiny"
+                        onClick={() => openPreview(item.id, 'crop')}
+                        title="Edit crop manual"
+                      >
+                        Edit
+                      </button>
                       {mode === 'separate' && !group && item.pdfBlob && (
                         <button
                           type="button"
@@ -527,6 +724,16 @@ function App() {
                 );
               })}
             </ul>
+
+            {mode === 'separate' && selectedImages.length >= 2 && (
+              <GroupPreviewPanel
+                selectedImages={selectedImages}
+                groupName={draftGroupName}
+                onGroupNameChange={setDraftGroupName}
+                onCreateGroup={handleCreateGroup}
+                onClearSelection={() => setSelectedIds([])}
+              />
+            )}
           </section>
 
           <section className="actions">
@@ -565,17 +772,12 @@ function App() {
       {previewItem && (
         <ImagePreviewModal
           item={previewItem}
+          initialMode={previewInitialMode}
           onClose={() => setPreviewId(null)}
           onApplyChanges={applyImageChanges}
           onToggleEnhance={handleToggleEnhance}
-        />
-      )}
-
-      {showGroupModal && (
-        <GroupNameModal
-          defaultName={`grup-${groups.length + 1}`}
-          onConfirm={handleCreateGroup}
-          onCancel={() => setShowGroupModal(false)}
+          onRapikan={handleRapikan}
+          onResetOriginal={handleResetOriginal}
         />
       )}
 

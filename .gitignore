@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# OpenCV di-copy otomatis dari node_modules saat npm run dev/build
+public/opencv/opencv.js
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
