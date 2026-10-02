@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Test Auto-Crop</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 1rem;
+        background: #f5f5fa;
+      }
+      h1 { font-size: 1.2rem; }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+      }
+      img {
+        max-width: 100%;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .box {
+        background: #fff;
+        padding: 1rem;
+        border-radius: 12px;
+      }
+      .status { margin: 1rem 0; font-weight: 600; }
+      .ok { color: #059669; }
+      .fail { color: #dc2626; }
+    </style>
+  </head>
+  <body>
+    <h1>Test Auto-Crop — sample dokumen UIR</h1>
+    <p id="status" class="status">Memproses...</p>
+    <p style="color:#666;font-size:0.9rem">Crop + perspektif saja (warna sudah acc, enhance OFF)</p>
+    <div class="grid">
+      <div class="box">
+        <h2>Asli</h2>
+        <img id="original" src="/sample-dokumen.png" alt="Original" />
+      </div>
+      <div class="box">
+        <h2>Hasil Auto-Crop</h2>
+        <img id="result" alt="Result" />
+      </div>
+    </div>
+    <script type="module">
+      import { autoScanDocument, buildProcessedImage } from '/src/utils/imageProcessing.js';
+
+      const status = document.getElementById('status');
+      const resultImg = document.getElementById('result');
+
+      async function run() {
+        try {
+          const res = await fetch('/sample-dokumen.png');
+          const blob = await res.blob();
+          const dataUrl = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+          });
+
+          const scanned = await autoScanDocument(dataUrl, true);
+          if (!scanned.autoCropApplied) {
+            status.textContent = 'Auto-crop GAGAL — tidak yakin dengan tepi kertas';
+            status.className = 'status fail';
+            return;
+          }
+
+          const item = { originalDataUrl: dataUrl, ...scanned };
+          const { dataUrl: cropped } = await buildProcessedImage(item, scanned.cropRect, false);
+          resultImg.src = cropped;
+          const { cropRect } = scanned;
+          const mode = scanned.scanBaseDataUrl !== dataUrl ? 'perspektif + crop' : 'crop';
+          status.textContent = `Auto-crop BERHASIL (${mode}) — ${cropRect.width}×${cropRect.height}px`;
+          status.className = 'status ok';
+        } catch (err) {
+          status.textContent = 'Error: ' + err.message;
+          status.className = 'status fail';
+          console.error(err);
+        }
+      }
+
+      run();
+    </script>
+  </body>
+</html>

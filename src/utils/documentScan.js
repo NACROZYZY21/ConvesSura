@@ -379,21 +379,26 @@ function findBottomAtColumn(gray, width, height, x, bgLum, xSpread = 12) {
 
 export function refineDetectedQuad(gray, width, height, bgLum, corners) {
   const [tl0, tr0, br0, bl0] = orderCorners(corners);
-  const leftX = Math.min(tl0.x, bl0.x);
-  let rightX = Math.max(tr0.x, br0.x);
 
+  // Pertahankan trapesium perspektif asli, jangan paksa sisi kiri/kanan vertikal.
+  const topLeftY = Math.min(tl0.y, findTopAtColumn(gray, width, height, tl0.x, bgLum, 8));
+  const topRightY = Math.min(tr0.y, findTopAtColumn(gray, width, height, tr0.x, bgLum, 8));
+  const bottomLeftY = Math.max(bl0.y, findBottomAtColumn(gray, width, height, bl0.x, bgLum, 10));
+  const bottomRightY = Math.max(br0.y, findBottomAtColumn(gray, width, height, br0.x, bgLum, 10));
+
+  let tl = { x: tl0.x, y: topLeftY };
+  let tr = { x: tr0.x, y: topRightY };
+  let br = { x: br0.x, y: bottomRightY };
+  let bl = { x: bl0.x, y: bottomLeftY };
+
+  const tightLeft = findLeftPaperEdge(gray, width, height, bgLum);
   const tightRight = findRightPaperEdge(gray, width, height, bgLum);
-  if (tightRight < rightX) rightX = tightRight;
+  if (tl.x < tightLeft - 2) tl = { ...tl, x: tightLeft };
+  if (bl.x < tightLeft - 2) bl = { ...bl, x: tightLeft };
+  if (tr.x > tightRight + 2) tr = { ...tr, x: tightRight };
+  if (br.x > tightRight + 2) br = { ...br, x: tightRight };
 
-  const bottomLeft = Math.max(findBottomAtColumn(gray, width, height, leftX, bgLum), bl0.y);
-  const bottomRight = Math.max(findBottomAtColumn(gray, width, height, rightX, bgLum), br0.y);
-
-  return [
-    { x: leftX, y: tl0.y },
-    { x: rightX, y: tr0.y },
-    { x: rightX, y: Math.max(bottomRight, br0.y) },
-    { x: leftX, y: Math.max(bottomLeft, bl0.y) },
-  ];
+  return [tl, tr, br, bl];
 }
 
 function pushCornerCandidate(list, corners, width, height) {

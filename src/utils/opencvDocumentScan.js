@@ -43,10 +43,9 @@ function scoreQuad(corners, imageArea) {
   const hRight = dist(tr, br);
   const minW = Math.min(wTop, wBottom);
   const minH = Math.min(hLeft, hRight);
-  const maxW = Math.max(wTop, wBottom);
-  const maxH = Math.max(hLeft, hRight);
 
-  if (minW < 40 || minH < 40) return -1;
+  /* Relaxed min-size — smaller paper at distance still valid */
+  if (minW < 30 || minH < 30) return -1;
 
   const area = Math.abs(
     (tl.x * tr.y - tr.x * tl.y) +
@@ -55,10 +54,12 @@ function scoreQuad(corners, imageArea) {
       (bl.x * tl.y - tl.x * bl.y),
   ) / 2;
   const areaRatio = area / imageArea;
-  if (areaRatio < 0.12 || areaRatio > 0.94) return -1;
+
+  /* Relaxed: accept quads covering 8–96 % of image */
+  if (areaRatio < 0.08 || areaRatio > 0.96) return -1;
 
   const aspect = minW / minH;
-  if (aspect < 0.25 || aspect > 4.5) return -1;
+  if (aspect < 0.2 || aspect > 5.0) return -1;
 
   const parallelScore =
     1 - Math.abs(wTop - wBottom) / Math.max(wTop, wBottom) +
@@ -67,67 +68,180 @@ function scoreQuad(corners, imageArea) {
   return areaRatio * 0.55 + parallelScore * 0.25 + (1 - areaRatio) * 0.2;
 }
 
-function detectQuadContour(cv, mat, scale) {
-  const gray = new cv.Mat();
-  const blur = new cv.Mat();
-  const edges = new cv.Mat();
-  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-  const closed = new cv.Mat();
-  const contours = new cv.MatVector();
-  const hierarchy = new cv.Mat();
+/* ───────────────────────────────────────────────────────────
+   scanForQuads — find quadrilateral contours in a binary image
+   Shared helper used by all detection strategies.
+   ─────────────────────────────────────────────────────────── */
+function scanForQuads(cv, binary, imageArea, scale) {
+  const candidates = [];
 
-  const imageArea = mat.rows * mat.cols;
-  let best = null;
-  let bestScore = -1;
-  const cannyPairs = [
-    [30, 90],
-    [50, 150],
-    [75, 200],
-  ];
-  const retrievalModes = [cv.RETR_EXTERNAL, cv.RETR_LIST];
+  for (const mode of [cv.RETR_EXTERNAL, cv.RETR_LIST]) {
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
 
-  try {
-    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+    try {
+      cv.findContours(binary, contours, hierarchy, mode, cv.CHAIN_APPROX_SIMPLE);
 
-    for (const [low, high] of cannyPairs) {
-      cv.Canny(blur, edges, low, high);
-      cv.dilate(edges, closed, kernel);
+      for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        const area = cv.contourArea(contour);
+        if (area < imageArea * 0.08 || area > imageArea * 0.96) continue;
 
-      for (const mode of retrievalModes) {
-        cv.findContours(closed, contours, hierarchy, mode, cv.CHAIN_APPROX_SIMPLE);
+        const peri = cv.arcLength(contour, true);
 
-        for (let i = 0; i < contours.size(); i++) {
-          const contour = contours.get(i);
-          const area = cv.contourArea(contour);
-          if (area < imageArea * 0.1 || area > imageArea * 0.96) continue;
-
-          const peri = cv.arcLength(contour, true);
+        /* Try multiple epsilon values — looser eps helps when
+           edges are slightly noisy or rounded */
+        for (const eps of [0.02, 0.035, 0.05]) {
           const approx = new cv.Mat();
-          cv.approxPolyDP(contour, approx, 0.02 * peri, true);
+          cv.approxPolyDP(contour, approx, eps * peri, true);
 
           if (approx.rows === 4 && cv.isContourConvex(approx)) {
             const points = extractQuadPoints(cv, approx, scale);
             const score = scoreQuad(points, imageArea / (scale * scale));
-            if (score > bestScore) {
-              bestScore = score;
-              best = points;
-            }
+            if (score > 0) candidates.push({ corners: points, score });
           }
           approx.delete();
         }
       }
+    } finally {
+      contours.delete();
+      hierarchy.delete();
+    }
+  }
+
+  return candidates;
+}
+
+/* ───────────────────────────────────────────────────────────
+   detectQuadContour — multi-strategy document quad detection
+
+   Strategy 1:  Canny edge detection with MULTIPLE blur levels
+                (larger blur suppresses batik/cloth texture)
+   Strategy 2:  OTSU thresholding — separates white paper from
+                colorful/dark background even with heavy texture
+   Strategy 3:  Canny on cleaned OTSU result for sharp edges
+   ─────────────────────────────────────────────────────────── */
+function detectQuadContour(cv, mat, scale) {
+  const gray = new cv.Mat();
+  const imageArea = mat.rows * mat.cols;
+  const allCandidates = [];
+
+  try {
+    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+
+    /* ── Strategy 1: Canny with multiple blur levels ──────────
+       Larger Gaussian kernels suppress busy background textures
+       (batik, tablecloths, patterned surfaces) so the real paper
+       edges stand out in the Canny output. */
+    const blurSizes = [5, 9, 15];
+    const cannyPairs = [
+      [20, 60],   /* very sensitive — catches subtle paper edges */
+      [30, 90],
+      [50, 150],
+      [75, 200],
+    ];
+
+    for (const ksize of blurSizes) {
+      const blurred = new cv.Mat();
+      cv.GaussianBlur(gray, blurred, new cv.Size(ksize, ksize), 0);
+
+      for (const [low, high] of cannyPairs) {
+        const edges = new cv.Mat();
+        cv.Canny(blurred, edges, low, high);
+
+        /* Morphological CLOSE (dilate → erode) instead of bare dilate.
+           Connects fragmented edges while removing small noise dots. */
+        const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+        const closed = new cv.Mat();
+        cv.morphologyEx(edges, closed, cv.MORPH_CLOSE, kernel);
+        kernel.delete();
+
+        allCandidates.push(...scanForQuads(cv, closed, imageArea, scale));
+
+        edges.delete();
+        closed.delete();
+      }
+
+      blurred.delete();
     }
 
-    return best;
+    /* ── Strategy 2: OTSU thresholding ──────────────────────
+       Best for white paper on busy/colorful backgrounds.
+       Heavy blur (21×21) crushes the background texture,
+       then OTSU automatically finds the brightness threshold
+       that separates paper (bright) from background (darker). */
+    const heavyBlur = new cv.Mat();
+    cv.GaussianBlur(gray, heavyBlur, new cv.Size(21, 21), 0);
+
+    const otsu = new cv.Mat();
+    cv.threshold(heavyBlur, otsu, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+    heavyBlur.delete();
+
+    /* Morphological close fills holes inside the paper region
+       and smooths the boundary for cleaner contour detection */
+    const otsuKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(11, 11));
+    const otsuClosed = new cv.Mat();
+    cv.morphologyEx(otsu, otsuClosed, cv.MORPH_CLOSE, otsuKernel);
+    otsuKernel.delete();
+    otsu.delete();
+
+    allCandidates.push(...scanForQuads(cv, otsuClosed, imageArea, scale));
+
+    /* ── Strategy 3: Canny on cleaned OTSU ────────────────
+       The OTSU binary mask has clean paper/background separation.
+       Applying Canny on this gives crisp quad edges even when
+       the original image had noisy edges. */
+    const otsuEdges = new cv.Mat();
+    cv.Canny(otsuClosed, otsuEdges, 50, 150);
+
+    const dilKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+    const otsuDilated = new cv.Mat();
+    cv.dilate(otsuEdges, otsuDilated, dilKernel);
+    dilKernel.delete();
+
+    allCandidates.push(...scanForQuads(cv, otsuDilated, imageArea, scale));
+
+    otsuEdges.delete();
+    otsuDilated.delete();
+    otsuClosed.delete();
+
+    /* ── Strategy 4: Blue-channel isolation ───────────────
+       Yellow, orange, wooden tables have very low blue values (B < 70)
+       while white paper receipts have high blue (B > 180).
+       This cleanly isolates receipts from colorful/warm tables! */
+    try {
+      const channels = new cv.MatVector();
+      cv.split(mat, channels);
+      if (channels.size() >= 3) {
+        const blueMat = channels.get(2);
+        const blueBlur = new cv.Mat();
+        cv.GaussianBlur(blueMat, blueBlur, new cv.Size(15, 15), 0);
+        const blueOtsu = new cv.Mat();
+        cv.threshold(blueBlur, blueOtsu, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+        const bKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9));
+        const blueClosed = new cv.Mat();
+        cv.morphologyEx(blueOtsu, blueClosed, cv.MORPH_CLOSE, bKernel);
+
+        allCandidates.push(...scanForQuads(cv, blueClosed, imageArea, scale));
+
+        bKernel.delete();
+        blueBlur.delete();
+        blueOtsu.delete();
+        blueClosed.delete();
+      }
+      channels.delete();
+    } catch {
+      /* ignore channel split error */
+    }
+
+    /* Pick the best-scoring quad from all strategies */
+    if (allCandidates.length === 0) return null;
+
+    allCandidates.sort((a, b) => b.score - a.score);
+    return allCandidates[0].corners;
+
   } finally {
     gray.delete();
-    blur.delete();
-    edges.delete();
-    kernel.delete();
-    closed.delete();
-    contours.delete();
-    hierarchy.delete();
   }
 }
 

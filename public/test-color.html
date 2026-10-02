@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Test Perjelas Warna</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 1rem;
+        background: #f5f5fa;
+      }
+      h1 { font-size: 1.2rem; }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+      }
+      img {
+        max-width: 100%;
+        border: 2px solid #ddd;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .box {
+        background: #fff;
+        padding: 1rem;
+        border-radius: 12px;
+      }
+      .status { margin: 1rem 0; font-weight: 600; color: #059669; }
+    </style>
+  </head>
+  <body>
+    <h1>Test Perjelas Warna — tanpa crop</h1>
+    <p id="status" class="status">Memproses...</p>
+    <div class="grid">
+      <div class="box">
+        <h2>Asli</h2>
+        <img id="original" src="/sample-dokumen.png" alt="Original" />
+      </div>
+      <div class="box">
+        <h2>Perjelas Gambar</h2>
+        <img id="result" alt="Result" />
+      </div>
+    </div>
+    <script type="module">
+      import { applyEnhanceFilter } from '/src/utils/imageProcessing.js';
+
+      const status = document.getElementById('status');
+      const resultImg = document.getElementById('result');
+
+      async function run() {
+        try {
+          const res = await fetch('/sample-dokumen.png');
+          const blob = await res.blob();
+          const dataUrl = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(blob);
+          });
+
+          const enhanced = await applyEnhanceFilter(dataUrl);
+          resultImg.src = enhanced;
+          status.textContent = 'Filter warna diterapkan pada foto asli (crop tidak dipakai)';
+        } catch (err) {
+          status.textContent = 'Error: ' + err.message;
+          status.className = 'status fail';
+          console.error(err);
+        }
+      }
+
+      run();
+    </script>
+  </body>
+</html>

@@ -9,17 +9,32 @@ import {
   normalizeCropRectForSource,
 } from '../utils/imageProcessing';
 
+function getDefaultCorners(width, height) {
+  const mx = Math.max(10, Math.round(width * 0.08));
+  const my = Math.max(10, Math.round(height * 0.08));
+  return [
+    { x: mx, y: my },
+    { x: width - mx, y: my },
+    { x: width - mx, y: height - my },
+    { x: mx, y: height - my },
+  ];
+}
+
 export default function ImagePreviewModal({
   item,
   initialMode = 'preview',
   onClose,
   onApplyChanges,
+  onApplyCorners,
   onToggleEnhance,
   onRapikan,
+  onRotate,
   onResetOriginal,
 }) {
   const [mode, setMode] = useState(initialMode);
+  const [cropType, setCropType] = useState('perspective'); // 'perspective' (4 sudut) | 'box' (kotak)
   const [showOriginal, setShowOriginal] = useState(false);
+  const [draftCorners, setDraftCorners] = useState(item.detectedCorners || null);
   const [draftCropRect, setDraftCropRect] = useState(item.cropRect);
   const [previewDataUrl, setPreviewDataUrl] = useState(item.dataUrl);
   const [enhanceEnabled, setEnhanceEnabled] = useState(item.enhanceEnabled ?? false);
@@ -39,6 +54,7 @@ export default function ImagePreviewModal({
     setEnhanceEnabled(item.enhanceEnabled ?? false);
     setCropSourceUrl(getCropSourceUrl(item));
     setAutoCropRect(item.autoCropRect || item.cropRect);
+    setDraftCorners(item.detectedCorners || null);
     setShowOriginal(false);
     setMode(initialMode);
     setRapikanNotice('');
@@ -49,16 +65,25 @@ export default function ImagePreviewModal({
     let cancelled = false;
 
     (async () => {
-      const source = getCropSourceUrl(item);
+      const source = item.originalDataUrl || getCropSourceUrl(item);
       const dims = await getImageDimensions(source);
       if (cancelled) return;
+
+      const corners =
+        item.detectedCorners && item.detectedCorners.length === 4
+          ? item.detectedCorners
+          : getDefaultCorners(dims.width, dims.height);
+
       const normalized = normalizeCropRectForSource(
         item.autoCropRect || item.cropRect,
         dims.width,
         dims.height,
       );
+
       setCropSourceUrl(source);
       setImageSize(dims);
+      setCropType('perspective');
+      setDraftCorners(corners);
       setDraftCropRect(normalized);
       setAutoCropRect(normalized);
     })();
@@ -75,7 +100,8 @@ export default function ImagePreviewModal({
     setEnhanceEnabled(item.enhanceEnabled ?? false);
     setCropSourceUrl(getCropSourceUrl(item));
     setAutoCropRect(item.autoCropRect || item.cropRect);
-  }, [item.cropRect, item.dataUrl, item.enhanceEnabled, item.scanBaseDataUrl, item.autoCropRect, mode]);
+    setDraftCorners(item.detectedCorners || null);
+  }, [item.cropRect, item.dataUrl, item.enhanceEnabled, item.scanBaseDataUrl, item.autoCropRect, item.detectedCorners, mode]);
 
   useEffect(() => {
     const onKeyDown = (e) => {
@@ -98,24 +124,41 @@ export default function ImagePreviewModal({
     setPreviewDataUrl(result.dataUrl);
     if (result.autoCropRect) setAutoCropRect(result.autoCropRect);
     if (result.scanBaseDataUrl) setCropSourceUrl(result.scanBaseDataUrl);
+    if (result.detectedCorners) setDraftCorners(result.detectedCorners);
     setShowOriginal(false);
   };
 
-  const enterCropMode = useCallback(async () => {
-    const source = getCropSourceUrl(item);
-    const dims = await getImageDimensions(source);
-    const normalized = normalizeCropRectForSource(
-      autoCropRect || item.cropRect,
-      dims.width,
-      dims.height,
-    );
+  const enterCropMode = useCallback(
+    async (targetCropType = 'perspective') => {
+      // Untuk mode 4 sudut, selalu gunakan foto asli agar seluruh meja & tepi kertas terlihat
+      const source =
+        targetCropType === 'perspective'
+          ? item.originalDataUrl || getCropSourceUrl(item)
+          : getCropSourceUrl(item);
 
-    setCropSourceUrl(source);
-    setImageSize(dims);
-    setDraftCropRect(normalized);
-    setAutoCropRect(normalized);
-    setMode('crop');
-  }, [autoCropRect, item]);
+      const dims = await getImageDimensions(source);
+
+      const corners =
+        item.detectedCorners && item.detectedCorners.length === 4
+          ? item.detectedCorners
+          : getDefaultCorners(dims.width, dims.height);
+
+      const normalized = normalizeCropRectForSource(
+        autoCropRect || item.cropRect,
+        dims.width,
+        dims.height,
+      );
+
+      setCropSourceUrl(source);
+      setImageSize(dims);
+      setCropType(targetCropType);
+      setDraftCorners(corners);
+      setDraftCropRect(normalized);
+      setAutoCropRect(normalized);
+      setMode('crop');
+    },
+    [autoCropRect, item],
+  );
 
   const handleRapikan = async () => {
     if (isUpdating || !onRapikan) return;
@@ -134,9 +177,30 @@ export default function ImagePreviewModal({
       }
       if (result.rapikanFailed) {
         setRapikanNotice('Tepi kertas tidak terdeteksi otomatis. Gunakan Edit Crop manual.');
+      } else if (result.usedGeminiAi) {
+        setRapikanNotice('✨ Dokumen berhasil diluruskan presisi tinggi dengan Gemini AI!');
+      } else if (result.geminiError) {
+        setRapikanNotice(`⚠️ Gemini AI: ${result.geminiError}`);
       }
       applyRapikanResult(result);
       setMode('preview');
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  const handleRotate = async () => {
+    if (isUpdating || !onRotate) return;
+    setIsUpdating(true);
+    setRapikanNotice('');
+    try {
+      const result = await onRotate(item.id, 90);
+      if (result) {
+        setPreviewDataUrl(result.dataUrl);
+        setCropSourceUrl(result.scanBaseDataUrl || result.originalDataUrl);
+        if (result.cropRect) setDraftCropRect(result.cropRect);
+        if (result.autoCropRect) setAutoCropRect(result.autoCropRect);
+      }
     } finally {
       setIsUpdating(false);
     }
@@ -185,18 +249,37 @@ export default function ImagePreviewModal({
 
   const handleApplyCrop = async () => {
     setIsUpdating(true);
+    setRapikanNotice('');
     try {
-      const normalized = normalizeCropRectForSource(
-        draftCropRect,
-        imageSize.width,
-        imageSize.height,
-      );
-      await onApplyChanges(item.id, {
-        cropRect: normalized,
-        enhanceEnabled,
-      });
+      // JIKA DALAM MODE 4 SUDUT BEBAS (PERSPECTIVE):
+      if (cropType === 'perspective' && draftCorners && draftCorners.length === 4) {
+        if (onApplyCorners) {
+          const res = await onApplyCorners(item.id, {
+            corners: draftCorners,
+            enhanceEnabled,
+          });
+          if (res) {
+            applyRapikanResult(res);
+            setRapikanNotice('✨ Dokumen berhasil diluruskan sesuai 4 sudut pilihan Anda!');
+          }
+        }
+      } else {
+        // JIKA DALAM MODE KOTAK STANDAR:
+        const normalized = normalizeCropRectForSource(
+          draftCropRect,
+          imageSize.width,
+          imageSize.height,
+        );
+        await onApplyChanges(item.id, {
+          cropRect: normalized,
+          enhanceEnabled,
+        });
+      }
       setMode('preview');
       setShowOriginal(false);
+    } catch (err) {
+      console.error('Apply crop error:', err);
+      setRapikanNotice(`Gagal menerapkan crop: ${err.message}`);
     } finally {
       setIsUpdating(false);
     }
@@ -205,6 +288,25 @@ export default function ImagePreviewModal({
   const handleResetCrop = () => {
     const reset = getResetCropRect(item, imageSize.width, imageSize.height);
     setDraftCropRect(reset);
+  };
+
+  const handleSetFullCorners = () => {
+    if (imageSize.width && imageSize.height) {
+      setDraftCorners([
+        { x: 0, y: 0 },
+        { x: imageSize.width, y: 0 },
+        { x: imageSize.width, y: imageSize.height },
+        { x: 0, y: imageSize.height },
+      ]);
+    }
+  };
+
+  const handleResetToAiCorners = () => {
+    if (item.detectedCorners && item.detectedCorners.length === 4) {
+      setDraftCorners(item.detectedCorners);
+    } else if (imageSize.width && imageSize.height) {
+      setDraftCorners(getDefaultCorners(imageSize.width, imageSize.height));
+    }
   };
 
   const handleBackdropClick = (e) => {
@@ -228,7 +330,7 @@ export default function ImagePreviewModal({
         <div className="modal__header">
           <div>
             <h2 id="preview-title">
-              {mode === 'crop' ? 'Sesuaikan Crop' : item.customName || 'Preview Gambar'}
+              {mode === 'crop' ? 'Sesuaikan Sudut Crop' : item.customName || 'Preview Gambar'}
             </h2>
             <div className="modal__badges">
               {isRapikanDoneFlag && mode === 'preview' && (
@@ -240,7 +342,7 @@ export default function ImagePreviewModal({
             </div>
           </div>
           <button type="button" className="modal__close" onClick={onClose} aria-label="Tutup">
-            ✕
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
           </button>
         </div>
 
@@ -284,14 +386,26 @@ export default function ImagePreviewModal({
           ) : (
             <div className="modal__crop-panel">
               <p className="modal__crop-hint">
-                Tarik sudut crop ke <strong>luar</strong> jika teks masih terpotong. Puas? Tekan{' '}
-                <strong>Selesai</strong>. Tidak puas otomatis? <strong>Rapikan Ulang</strong>.
+                {cropType === 'perspective' ? (
+                  <>
+                    💡 Tarik <strong>1 per 1 titik lingkaran</strong> ke sudut fisik kertas/struk.
+                    Kaca pembesar akan otomatis muncul saat Anda menggeser titik!
+                  </>
+                ) : (
+                  <>
+                    Tarik sudut kotak crop. Tekan <strong>Selesai</strong> setelah selesai.
+                  </>
+                )}
               </p>
               {imageSize.width > 0 ? (
                 <CropEditor
                   imageSrc={cropSourceUrl}
                   imageWidth={imageSize.width}
                   imageHeight={imageSize.height}
+                  cropType={cropType}
+                  onCropTypeChange={setCropType}
+                  corners={draftCorners}
+                  onCornersChange={setDraftCorners}
                   cropRect={draftCropRect}
                   onCropChange={setDraftCropRect}
                 />
@@ -328,33 +442,63 @@ export default function ImagePreviewModal({
               <button
                 type="button"
                 className="btn btn--small btn--outline"
-                onClick={enterCropMode}
+                onClick={() => enterCropMode('perspective')}
                 disabled={isUpdating}
+                title="Sesuaikan 4 sudut dokumen secara bebas"
               >
-                Edit Crop
+                📐 Edit Sudut
+              </button>
+              <button
+                type="button"
+                className="btn btn--small btn--outline"
+                onClick={handleRotate}
+                disabled={isUpdating}
+                title="Putar 90 derajat searah jarum jam"
+              >
+                🔄 Putar 90°
               </button>
             </>
           ) : (
             <>
               <button
                 type="button"
-                className="btn btn--small btn--secondary"
+                className="btn btn--small btn--primary"
                 onClick={handleApplyCrop}
                 disabled={isUpdating || imageSize.width === 0}
               >
-                Selesai
+                ✓ Selesai
               </button>
-              <button
-                type="button"
-                className="btn btn--small btn--outline"
-                onClick={handleRapikan}
-                disabled={isUpdating}
-              >
-                Rapikan Ulang
-              </button>
-              <button type="button" className="btn btn--small btn--outline" onClick={handleResetCrop}>
-                Reset Crop Otomatis
-              </button>
+              {cropType === 'perspective' && (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn--small btn--outline"
+                    onClick={handleSetFullCorners}
+                    title="Pilih seluruh area foto"
+                  >
+                    Seluruh Foto
+                  </button>
+                  {item.detectedCorners && (
+                    <button
+                      type="button"
+                      className="btn btn--small btn--outline"
+                      onClick={handleResetToAiCorners}
+                      title="Kembalikan ke sudut deteksi AI"
+                    >
+                      Reset Sudut AI
+                    </button>
+                  )}
+                </>
+              )}
+              {cropType === 'box' && (
+                <button
+                  type="button"
+                  className="btn btn--small btn--outline"
+                  onClick={handleResetCrop}
+                >
+                  Reset Kotak
+                </button>
+              )}
               <button
                 type="button"
                 className="btn btn--small btn--outline"
@@ -363,8 +507,12 @@ export default function ImagePreviewModal({
               >
                 Kembali ke Asli
               </button>
-              <button type="button" className="btn btn--small btn--outline" onClick={() => setMode('preview')}>
-                Kembali Preview
+              <button
+                type="button"
+                className="btn btn--small btn--outline"
+                onClick={() => setMode('preview')}
+              >
+                Batal
               </button>
             </>
           )}

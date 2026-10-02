@@ -11,6 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.local
+.env.*.local
 
 # OpenCV di-copy otomatis dari node_modules saat npm run dev/build
 public/opencv/opencv.js

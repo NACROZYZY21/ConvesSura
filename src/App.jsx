@@ -1,6 +1,8 @@
 import { useCallback, useRef, useState } from 'react';
 import GroupPreviewPanel from './components/GroupPreviewPanel';
 import ImagePreviewModal from './components/ImagePreviewModal';
+import GeminiApiKeyModal from './components/GeminiApiKeyModal';
+import { hasGeminiApiKey } from './utils/geminiVision';
 import {
   convertMergedImages,
   convertSingleImage,
@@ -17,7 +19,7 @@ import {
   isSeparateConvertComplete,
   removeImageFromGroups,
 } from './utils/groupHelpers';
-import { buildProcessedImage, processUploadedImage, rapikanImage, fullCropRect, getImageDimensions, isRapikanDone } from './utils/imageProcessing';
+import { buildProcessedImage, processUploadedImage, rapikanImage, rotateImageItem, warpWithExactCorners, fullCropRect, getImageDimensions, isRapikanDone } from './utils/imageProcessing';
 import './App.css';
 
 function createId() {
@@ -41,6 +43,8 @@ function App() {
   const [dragIndex, setDragIndex] = useState(null);
   const [previewId, setPreviewId] = useState(null);
   const [previewInitialMode, setPreviewInitialMode] = useState('preview');
+  const [showGeminiModal, setShowGeminiModal] = useState(false);
+  const [hasAiKey, setHasAiKey] = useState(() => hasGeminiApiKey());
   const fileInputRef = useRef(null);
   const imagesRef = useRef(images);
   imagesRef.current = images;
@@ -67,20 +71,24 @@ function App() {
     setProgress('Memuat gambar...');
 
     try {
-      const newItems = await Promise.all(
-        accepted.map(async (file) => {
-          const originalDataUrl = await fileToDataUrl(file);
-          const processed = await processUploadedImage(file, originalDataUrl);
-
-          return {
-            id: createId(),
-            file,
-            customName: stripExtension(file.name),
-            pdfBlob: null,
-            ...processed,
-          };
-        }),
-      );
+      const newItems = [];
+      for (let i = 0; i < accepted.length; i++) {
+        const file = accepted[i];
+        setProgress(
+          accepted.length > 1
+            ? `Memindai ${i + 1}/${accepted.length}: ${stripExtension(file.name)}`
+            : `Memindai dokumen: ${stripExtension(file.name)}`,
+        );
+        const originalDataUrl = await fileToDataUrl(file);
+        const processed = await processUploadedImage(file, originalDataUrl);
+        newItems.push({
+          id: createId(),
+          file,
+          customName: stripExtension(file.name),
+          pdfBlob: null,
+          ...processed,
+        });
+      }
 
       setImages((prev) => [...prev, ...newItems]);
       clearPdfResults();
@@ -141,14 +149,45 @@ function App() {
           autoCropApplied: tidied.autoCropApplied,
           enhanceEnabled: item.enhanceEnabled ?? false,
           autoEnhanceApplied: item.autoEnhanceApplied ?? false,
+          usedGeminiAi: tidied.usedGeminiAi ?? false,
         });
-        return result ? { ...result, rapikanFailed: !isRapikanDone({ ...item, ...result, scanBaseDataUrl: result.scanBaseDataUrl }) } : null;
+        return result
+          ? {
+              ...result,
+              rapikanFailed: !isRapikanDone({
+                ...item,
+                ...result,
+                scanBaseDataUrl: result.scanBaseDataUrl,
+              }),
+              usedGeminiAi: tidied.usedGeminiAi ?? false,
+              geminiError: tidied.geminiError || null,
+            }
+          : null;
       } catch (err) {
         console.error(err);
         return { rapikanFailed: true, error: err.message };
       }
     },
     [updateImageProcessing],
+  );
+
+  const handleRotate = useCallback(
+    async (id, angleDeg = 90) => {
+      const item = imagesRef.current.find((img) => img.id === id);
+      if (!item) return null;
+      try {
+        const rotated = await rotateImageItem(item, angleDeg);
+        setImages((prev) =>
+          prev.map((img) => (img.id === id ? { ...rotated, pdfBlob: null } : { ...img, pdfBlob: null })),
+        );
+        clearPdfResults();
+        return rotated;
+      } catch (err) {
+        console.error('Rotate failed:', err);
+        return null;
+      }
+    },
+    [clearPdfResults],
   );
 
   const handleResetOriginal = useCallback(
@@ -184,6 +223,54 @@ function App() {
       });
     },
     [updateImageProcessing],
+  );
+
+  const handleApplyCorners = useCallback(
+    async (id, { corners, enhanceEnabled }) => {
+      const item = imagesRef.current.find((img) => img.id === id);
+      if (!item) return null;
+
+      try {
+        const sourceUrl = item.originalDataUrl || item.scanBaseDataUrl;
+        const warped = await warpWithExactCorners(sourceUrl, corners);
+        if (!warped) {
+          throw new Error('Gagal meluruskan dokumen dengan 4 sudut tersebut.');
+        }
+
+        const updatedItem = {
+          ...item,
+          scanBaseDataUrl: warped.scanBaseDataUrl,
+          cropRect: warped.cropRect,
+          autoCropRect: warped.autoCropRect,
+          detectedCorners: corners,
+          autoCropApplied: true,
+          enhanceEnabled: enhanceEnabled ?? item.enhanceEnabled ?? false,
+          autoEnhanceApplied: enhanceEnabled ?? item.enhanceEnabled ?? false,
+        };
+
+        const { dataUrl } = await buildProcessedImage(
+          updatedItem,
+          warped.cropRect,
+          updatedItem.enhanceEnabled,
+        );
+
+        const result = {
+          ...updatedItem,
+          dataUrl,
+          pdfBlob: null,
+        };
+
+        setImages((prev) =>
+          prev.map((img) => (img.id === id ? result : { ...img, pdfBlob: null })),
+        );
+        clearPdfResults();
+        return result;
+      } catch (err) {
+        console.error('handleApplyCorners error:', err);
+        throw err;
+      }
+    },
+    [clearPdfResults],
   );
 
   const handleToggleEnhance = useCallback(
@@ -421,6 +508,18 @@ function App() {
 
   return (
     <div className="app">
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '14px' }}>
+        <button
+          type="button"
+          className={`gemini-nav-btn ${hasAiKey ? 'gemini-nav-btn--active' : ''}`}
+          onClick={() => setShowGeminiModal(true)}
+          title="Pengaturan Google AI Studio Gemini Vision"
+        >
+          <span className={`gemini-nav-btn__dot ${hasAiKey ? '' : 'gemini-nav-btn__dot--off'}`} />
+          <span>✨ Gemini AI {hasAiKey ? '(Aktif)' : '(Setup Key)'}</span>
+        </button>
+      </div>
+
       <header className="header">
         <h1>Image to PDF</h1>
         <p>Ubah gambar PNG/JPG menjadi PDF — langsung di browser, tanpa upload ke server.</p>
@@ -441,10 +540,16 @@ function App() {
           if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click();
         }}
       >
-        <div className="upload-zone__icon">📁</div>
+        <div className="upload-zone__icon">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{color: 'var(--color-primary-500)'}}>
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="17 8 12 3 7 8" />
+            <line x1="12" y1="3" x2="12" y2="15" />
+          </svg>
+        </div>
         <p className="upload-zone__title">Tarik & lepas gambar di sini</p>
         <p className="upload-zone__hint">
-          PNG / JPG · upload dulu, lalu rapikan & perjelas manual (per file atau semua sekaligus)
+          PNG / JPG · auto-scan seperti CamScanner saat upload
         </p>
         <input
           ref={fileInputRef}
@@ -643,7 +748,7 @@ function App() {
                       </label>
                     )}
                     <div className="image-item__drag" aria-hidden="true">
-                      ⠿
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="3" r="1.5" /><circle cx="11" cy="3" r="1.5" /><circle cx="5" cy="8" r="1.5" /><circle cx="11" cy="8" r="1.5" /><circle cx="5" cy="13" r="1.5" /><circle cx="11" cy="13" r="1.5" /></svg>
                     </div>
                     <button
                       type="button"
@@ -702,6 +807,14 @@ function App() {
                       >
                         Edit
                       </button>
+                      <button
+                        type="button"
+                        className="btn btn--small btn--outline btn--tiny"
+                        onClick={() => handleRotate(item.id, 90)}
+                        title="Putar 90°"
+                      >
+                        🔄
+                      </button>
                       {mode === 'separate' && !group && item.pdfBlob && (
                         <button
                           type="button"
@@ -717,7 +830,7 @@ function App() {
                         onClick={() => removeImage(item.id)}
                         aria-label="Hapus gambar"
                       >
-                        ✕
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
                       </button>
                     </div>
                   </li>
@@ -775,11 +888,19 @@ function App() {
           initialMode={previewInitialMode}
           onClose={() => setPreviewId(null)}
           onApplyChanges={applyImageChanges}
+          onApplyCorners={handleApplyCorners}
           onToggleEnhance={handleToggleEnhance}
           onRapikan={handleRapikan}
+          onRotate={handleRotate}
           onResetOriginal={handleResetOriginal}
         />
       )}
+
+      <GeminiApiKeyModal
+        isOpen={showGeminiModal}
+        onClose={() => setShowGeminiModal(false)}
+        onKeySaved={(key) => setHasAiKey(Boolean(key))}
+      />
 
       {showOverlay && (
         <div className="overlay" role="status" aria-live="polite">

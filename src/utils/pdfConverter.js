@@ -29,6 +29,13 @@ function getOrientation(width, height) {
   return width > height ? 'landscape' : 'portrait';
 }
 
+const A4_RATIO = 210 / 297;
+
+function isA4LikePage(width, height) {
+  const ratio = width / height;
+  return Math.abs(ratio - A4_RATIO) < 0.04 || Math.abs(ratio - 1 / A4_RATIO) < 0.04;
+}
+
 export async function fileToDataUrl(file) {
   return readFileAsDataUrl(file);
 }
@@ -38,6 +45,18 @@ export async function convertSingleImage(file, dataUrl) {
   const { naturalWidth: width, naturalHeight: height } = img;
   const format = getImageFormat(file, dataUrl);
   const orientation = getOrientation(width, height);
+
+  if (isA4LikePage(width, height)) {
+    const pdf = new jsPDF({
+      orientation,
+      unit: 'pt',
+      format: 'a4',
+    });
+    const pageW = orientation === 'portrait' ? 595.28 : 841.89;
+    const pageH = orientation === 'portrait' ? 841.89 : 595.28;
+    pdf.addImage(dataUrl, format, 0, 0, pageW, pageH, undefined, 'FAST');
+    return pdf.output('blob');
+  }
 
   const pdf = new jsPDF({
     orientation,
@@ -61,19 +80,32 @@ export async function convertMergedImages(items) {
     const { naturalWidth: width, naturalHeight: height } = img;
     const format = getImageFormat(file, dataUrl);
     const orientation = getOrientation(width, height);
+    const useA4 = isA4LikePage(width, height);
 
     if (i === 0) {
-      pdf = new jsPDF({
-        orientation,
-        unit: 'px',
-        format: [width, height],
-        hotfixes: ['px_scaling'],
-      });
+      pdf = new jsPDF(
+        useA4
+          ? { orientation, unit: 'pt', format: 'a4' }
+          : {
+              orientation,
+              unit: 'px',
+              format: [width, height],
+              hotfixes: ['px_scaling'],
+            },
+      );
+    } else if (useA4) {
+      pdf.addPage('a4', orientation);
     } else {
       pdf.addPage([width, height], orientation);
     }
 
-    pdf.addImage(dataUrl, format, 0, 0, width, height, undefined, 'FAST');
+    if (useA4) {
+      const pageW = orientation === 'portrait' ? 595.28 : 841.89;
+      const pageH = orientation === 'portrait' ? 841.89 : 595.28;
+      pdf.addImage(dataUrl, format, 0, 0, pageW, pageH, undefined, 'FAST');
+    } else {
+      pdf.addImage(dataUrl, format, 0, 0, width, height, undefined, 'FAST');
+    }
   }
 
   return pdf.output('blob');

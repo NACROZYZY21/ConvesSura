@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="id"><head><meta charset="UTF-8" /><title>Test Auto Scan</title></head>
+<body>
+<p id="status">Memproses...</p>
+<img id="out" style="max-width:420px;border:1px solid #ccc" alt="hasil" />
+<script type="module">
+  import { processUploadedImage, isRapikanDone } from '/src/utils/imageProcessing.js';
+  const path = '/test-user/06-checklist-karpet.png';
+  const res = await fetch(path);
+  const blob = await res.blob();
+  const dataUrl = await new Promise((r) => { const rd = new FileReader(); rd.onload = () => r(rd.result); rd.readAsDataURL(blob); });
+  const file = new File([blob], 'checklist.png', { type: 'image/png' });
+  const result = await processUploadedImage(file, dataUrl);
+  document.getElementById('out').src = result.dataUrl;
+  document.getElementById('status').textContent =
+    `scan=${isRapikanDone(result)} perjelas=${result.enhanceEnabled} size=${result.dataUrl.length}`;
+  window.__done = true;
+</script>
+</body></html>

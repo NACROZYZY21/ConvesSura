@@ -1,13 +1,13 @@
 import {
-  buildPaperMask,
   collectCornerCandidates,
   detectCornersFromAnalysis,
-  findDocumentCorners,
   outsetCorners,
-  perspectiveWarpCanvas,
-  refineCornersWithEdges,
 } from './documentScan.js';
 import { tryOpenCvDocumentWarp } from './opencvDocumentScan.js';
+import {
+  hasGeminiApiKey,
+  detectDocumentCornersWithGemini,
+} from './geminiVision.js';
 
 function loadImage(dataUrl) {
   return new Promise((resolve, reject) => {
@@ -361,39 +361,27 @@ function scoreCropResult(crop, width, height) {
 }
 
 function detectCropBounds(gray, width, height, bgLum) {
-  const bandY0 = Math.round(height * 0.05);
-  const bandY1 = Math.round(height * 0.95);
-
-  const rowHasContent = (y) => {
-    for (let x = 0; x < width; x++) {
-      if (gray[y * width + x] > 42) return true;
-    }
-    return false;
-  };
+  const bandY0 = Math.round(height * 0.04);
+  const bandY1 = Math.round(height * 0.96);
+  const paperCutoff = Math.max(158, bgLum + 32);
 
   const colPaperRatio = (x) => {
     let paper = 0;
     const total = bandY1 - bandY0 + 1;
     for (let y = bandY0; y <= bandY1; y++) {
-      if (isPaperPixel(gray[y * width + x], bgLum)) paper++;
+      if (gray[y * width + x] >= paperCutoff) paper++;
     }
     return paper / total;
   };
 
-  const colMedian = (x) => {
-    const lums = [];
-    for (let y = bandY0; y <= bandY1; y++) lums.push(gray[y * width + x]);
-    lums.sort((a, b) => a - b);
-    return lums[Math.floor(lums.length * 0.5)];
-  };
-
-  const rowMedian = (y) => {
-    const x0 = Math.round(width * 0.1);
-    const x1 = Math.round(width * 0.9);
-    const lums = [];
-    for (let x = x0; x <= x1; x++) lums.push(gray[y * width + x]);
-    lums.sort((a, b) => a - b);
-    return lums[Math.floor(lums.length * 0.5)];
+  const rowPaperRatio = (y) => {
+    const x0 = Math.round(width * 0.06);
+    const x1 = Math.round(width * 0.94);
+    let paper = 0;
+    for (let x = x0; x <= x1; x++) {
+      if (gray[y * width + x] >= paperCutoff) paper++;
+    }
+    return paper / (x1 - x0 + 1);
   };
 
   let minY = 0;
@@ -402,28 +390,28 @@ function detectCropBounds(gray, width, height, bgLum) {
   let maxX = width - 1;
 
   for (let y = 0; y < height; y++) {
-    if (rowHasContent(y)) {
+    if (rowPaperRatio(y) >= 0.32) {
       minY = y;
       break;
     }
   }
 
   for (let y = height - 1; y >= 0; y--) {
-    if (rowHasContent(y) && rowMedian(y) >= 165) {
+    if (rowPaperRatio(y) >= 0.32) {
       maxY = y;
       break;
     }
   }
 
   for (let x = 0; x < width; x++) {
-    if (colPaperRatio(x) >= 0.82 && colMedian(x) >= 168) {
+    if (colPaperRatio(x) >= 0.52) {
       minX = x;
       break;
     }
   }
 
   for (let x = width - 1; x >= 0; x--) {
-    if (colPaperRatio(x) >= 0.84 && colMedian(x) >= 175) {
+    if (colPaperRatio(x) >= 0.52) {
       maxX = x;
       break;
     }
@@ -431,9 +419,8 @@ function detectCropBounds(gray, width, height, bgLum) {
 
   const cropW = maxX - minX + 1;
   const cropH = maxY - minY + 1;
-  if (cropW < width * 0.82 || cropH < height * 0.88 || cropW < 40 || cropH < 40) {
-    return null;
-  }
+  const fill = (cropW * cropH) / (width * height);
+  if (fill < 0.1 || cropW < 40 || cropH < 40) return null;
 
   return { minX, minY, maxX, maxY, width, height };
 }
@@ -627,7 +614,8 @@ async function measureWarpBorderQuality(dataUrl) {
   const strip = Math.max(3, Math.round(Math.min(width, height) * 0.012));
   let nonPaper = 0;
   let total = 0;
-  const paperCutoff = 118;
+  /* Relaxed from 118 — warped edges often have shadow/color artefacts */
+  const paperCutoff = 95;
 
   const sample = (x, y) => {
     if (gray[y * width + x] < paperCutoff) nonPaper++;
@@ -656,11 +644,13 @@ async function scorePerspectivePackage(packaged, originalDataUrl) {
   const areaRatio = warpedArea / origArea;
 
   if (areaRatio > 1.06 || areaRatio < 0.06) return -1;
-  if (areaRatio < 0.28) return -1;
+  /* Relaxed from 0.28 — paper may occupy a smaller portion of the photo */
+  if (areaRatio < 0.12) return -1;
 
   const cropFill =
     (packaged.cropRect.width * packaged.cropRect.height) / (warped.width * warped.height);
-  if (cropFill < 0.28) return -1;
+  /* Relaxed from 0.28 — post-warp content detection can be conservative */
+  if (cropFill < 0.15) return -1;
 
   const borderQuality = await measureWarpBorderQuality(packaged.scanBaseDataUrl);
   const aspect = warped.width / Math.max(1, warped.height);
@@ -740,23 +730,232 @@ async function tryPerspectiveWarp(originalDataUrl) {
   return tried[0].result;
 }
 
-async function packageWarpResult(warped) {
-  const warpedDims = await getImageDimensions(warped);
-  let contentCrop = normalizeCropRectForSource(
-    await detectSuggestedCropRect(warped),
-    warpedDims.width,
-    warpedDims.height,
-  );
-
-  let fillRatio =
-    (contentCrop.width * contentCrop.height) / (warpedDims.width * warpedDims.height);
-  if (fillRatio < 0.18) {
-    contentCrop = fullCropRect(warpedDims.width, warpedDims.height);
-    fillRatio = 1;
+export async function warpWithExactCorners(originalDataUrl, corners) {
+  try {
+    const opencvWarped = await withTimeout(
+      tryOpenCvDocumentWarp(originalDataUrl, 2400, corners),
+      15000,
+      'OpenCV exact warp',
+    );
+    if (opencvWarped) {
+      const dims = await getImageDimensions(opencvWarped);
+      const full = fullCropRect(dims.width, dims.height);
+      return {
+        scanBaseDataUrl: opencvWarped,
+        cropRect: full,
+        autoCropRect: full,
+        autoCropApplied: true,
+      };
+    }
+  } catch (err) {
+    console.warn('OpenCV exact warp gagal, beralih ke canvas:', err);
   }
 
+  try {
+    const canvasWarped = await tryCanvasPerspectiveWarp(originalDataUrl, corners);
+    if (canvasWarped) {
+      return canvasWarped;
+    }
+  } catch (err) {
+    console.warn('Canvas exact warp gagal:', err);
+  }
+
+  return null;
+}
+
+export async function tryGeminiDocumentWarp(originalDataUrl) {
+  if (!hasGeminiApiKey()) return null;
+
+  try {
+    const aiResult = await detectDocumentCornersWithGemini(originalDataUrl);
+    if (!aiResult?.corners || aiResult.corners.length !== 4) return null;
+
+    let warped = await warpWithExactCorners(originalDataUrl, aiResult.corners);
+    if (!warped) return null;
+
+    if (aiResult.rotation && [90, 180, 270].includes(aiResult.rotation)) {
+      const rotatedUrl = await rotateDataUrl(warped.scanBaseDataUrl, aiResult.rotation);
+      const rDims = await getImageDimensions(rotatedUrl);
+      const rFull = fullCropRect(rDims.width, rDims.height);
+      warped = {
+        ...warped,
+        scanBaseDataUrl: rotatedUrl,
+        cropRect: rFull,
+        autoCropRect: rFull,
+      };
+    }
+
+    return {
+      ...warped,
+      usedGeminiAi: true,
+      detectedCorners: aiResult.corners,
+      model: aiResult.model,
+    };
+  } catch (err) {
+    console.warn('Gagal memproses dengan Gemini AI:', err);
+    throw err;
+  }
+}
+
+function skewProjectionScore(binary, width, height, angleDeg) {
+  const rad = (angleDeg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const cx = (width - 1) / 2;
+  const cy = (height - 1) / 2;
+  const projection = new Float32Array(height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!binary[y * width + x]) continue;
+      const dx = x - cx;
+      const dy = y - cy;
+      const row = dy * cos + dx * sin + cy;
+      const iy = Math.round(row);
+      if (iy >= 0 && iy < height) projection[iy] += 1;
+    }
+  }
+
+  let mean = 0;
+  for (let i = 0; i < height; i++) mean += projection[i];
+  mean /= height;
+
+  let variance = 0;
+  for (let i = 0; i < height; i++) {
+    const delta = projection[i] - mean;
+    variance += delta * delta;
+  }
+  return variance;
+}
+
+function estimateDocumentSkewAngle(gray, width, height) {
+  const binary = new Uint8Array(width * height);
+  for (let i = 0; i < width * height; i++) {
+    binary[i] = gray[i] < 182 ? 1 : 0;
+  }
+
+  let bestAngle = 0;
+  let bestScore = -1;
+  for (let angle = -9; angle <= 9; angle += 0.35) {
+    const score = skewProjectionScore(binary, width, height, angle);
+    if (score > bestScore) {
+      bestScore = score;
+      bestAngle = angle;
+    }
+  }
+
+  if (Math.abs(bestAngle) < 0.45) return 0;
+  return bestAngle;
+}
+
+export async function rotateDataUrl(dataUrl, angleDeg) {
+  if (Math.abs(angleDeg) < 0.2) return dataUrl;
+
+  const img = await loadImage(dataUrl);
+  const rad = (angleDeg * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const srcW = img.naturalWidth;
+  const srcH = img.naturalHeight;
+  const outW = Math.max(1, Math.round(srcW * cos + srcH * sin));
+  const outH = Math.max(1, Math.round(srcW * sin + srcH * cos));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fefefe';
+  ctx.fillRect(0, 0, outW, outH);
+  ctx.translate(outW / 2, outH / 2);
+  ctx.rotate(rad);
+  ctx.drawImage(img, -srcW / 2, -srcH / 2);
+  return canvasToDataUrl(canvas, dataUrl, { lossless: true });
+}
+
+export async function rotateImageItem(item, angleDeg = 90) {
+  const currentSource = item.scanBaseDataUrl || item.originalDataUrl;
+  const rotatedBase = await rotateDataUrl(currentSource, angleDeg);
+  const dims = await getImageDimensions(rotatedBase);
+  const newFull = fullCropRect(dims.width, dims.height);
+
+  let newOriginal = item.originalDataUrl;
+  if (!item.scanBaseDataUrl || item.scanBaseDataUrl === item.originalDataUrl) {
+    newOriginal = rotatedBase;
+  }
+
+  const updatedItem = {
+    ...item,
+    originalDataUrl: newOriginal,
+    scanBaseDataUrl: rotatedBase,
+    cropRect: newFull,
+    autoCropRect: newFull,
+  };
+
+  const { dataUrl } = await buildProcessedImage(
+    updatedItem,
+    newFull,
+    item.enhanceEnabled ?? false,
+  );
+
   return {
-    scanBaseDataUrl: warped,
+    ...updatedItem,
+    dataUrl,
+  };
+}
+
+async function deskewDocumentImage(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const maxDim = 560;
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, width, height);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const gray = new Float32Array(width * height);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = getLuminance(data[i], data[i + 1], data[i + 2]);
+  }
+
+  const angle = estimateDocumentSkewAngle(gray, width, height);
+  if (Math.abs(angle) < 0.45) return dataUrl;
+
+  const rotated = await rotateDataUrl(dataUrl, -angle);
+  const trimmed = await trimDocumentEdges(rotated);
+  return trimmed.dataUrl;
+}
+
+async function packageWarpResult(warped) {
+  let trimmed = await trimDocumentEdges(warped);
+  trimmed = {
+    ...trimmed,
+    dataUrl: await deskewDocumentImage(trimmed.dataUrl),
+  };
+  const deskewedDims = await getImageDimensions(trimmed.dataUrl);
+  trimmed.width = deskewedDims.width;
+  trimmed.height = deskewedDims.height;
+  const innerCrop = normalizeCropRectForSource(
+    await detectSuggestedCropRect(trimmed.dataUrl),
+    trimmed.width,
+    trimmed.height,
+  );
+  const innerFill =
+    (innerCrop.width * innerCrop.height) / (trimmed.width * trimmed.height);
+  if (innerFill >= 0.35 && innerFill <= 0.98) {
+    trimmed = {
+      dataUrl: await cropImage(trimmed.dataUrl, innerCrop, { lossless: true }),
+      width: innerCrop.width,
+      height: innerCrop.height,
+    };
+  }
+
+  const contentCrop = fullCropRect(trimmed.width, trimmed.height);
+
+  return {
+    scanBaseDataUrl: trimmed.dataUrl,
     cropRect: contentCrop,
     autoCropRect: contentCrop,
     autoCropApplied: true,
@@ -797,8 +996,18 @@ async function tryCanvasPerspectiveWarp(originalDataUrl, presetCorners = null) {
     y: point.y * renderScale,
   }));
 
-  const warped = perspectiveWarpCanvas(canvas, renderCorners, originalDataUrl, 2200);
   if (!warped) return null;
+
+  if (presetCorners) {
+    const dims = await getImageDimensions(warped);
+    const full = fullCropRect(dims.width, dims.height);
+    return {
+      scanBaseDataUrl: warped,
+      cropRect: full,
+      autoCropRect: full,
+      autoCropApplied: true,
+    };
+  }
 
   return packageWarpResult(warped);
 }
@@ -881,6 +1090,16 @@ export async function detectDocumentCrop(dataUrl) {
   };
 }
 
+let lastGeminiError = null;
+
+export function getLastGeminiError() {
+  return lastGeminiError;
+}
+
+export function clearLastGeminiError() {
+  lastGeminiError = null;
+}
+
 export async function autoScanDocument(originalDataUrl, autoCrop = true) {
   const dims = await getImageDimensions(originalDataUrl);
   const fullRect = fullCropRect(dims.width, dims.height);
@@ -894,18 +1113,32 @@ export async function autoScanDocument(originalDataUrl, autoCrop = true) {
     };
   }
 
+  // 1. Prioritaskan Gemini Vision AI jika API Key tersedia
+  if (hasGeminiApiKey()) {
+    try {
+      clearLastGeminiError();
+      const geminiWarped = await tryGeminiDocumentWarp(originalDataUrl);
+      if (geminiWarped) {
+        return geminiWarped;
+      }
+    } catch (err) {
+      lastGeminiError = err.message || 'Gagal memproses dengan Gemini AI';
+      console.warn('Gemini AI gagal, beralih ke deteksi lokal:', err);
+    }
+  }
+
   const warped = await tryPerspectiveWarp(originalDataUrl);
   if (warped) return warped;
 
   const detected = await detectDocumentCrop(originalDataUrl);
   if (detected) {
     const fillRatio = (detected.width * detected.height) / (dims.width * dims.height);
-    if (fillRatio < 0.88) {
+    if (fillRatio < 0.95) {
       return {
         scanBaseDataUrl: originalDataUrl,
         cropRect: detected,
         autoCropRect: detected,
-        autoCropApplied: false,
+        autoCropApplied: true,
       };
     }
   }
@@ -1071,7 +1304,7 @@ function smoothPaperSpeckle(data, width, height) {
 function applyDocumentScanLook(data, width, height) {
   const pixelCount = width * height;
   const lum = new Float32Array(pixelCount);
-  const paperTone = [254, 254, 252];
+  const paperTone = [255, 255, 255];
 
   for (let i = 0, p = 0; i < data.length; i += 4, p++) {
     lum[p] = getLuminance(data[i], data[i + 1], data[i + 2]);
@@ -1086,7 +1319,7 @@ function applyDocumentScanLook(data, width, height) {
     let b = data[i + 2];
 
     const bg = Math.max(bgLum[p], 50);
-    const flatten = Math.min(1.2, 228 / bg);
+    const flatten = Math.min(1.4, 235 / bg);
     r = clampByte(r * flatten);
     g = clampByte(g * flatten);
     b = clampByte(b * flatten);
@@ -1120,18 +1353,21 @@ function applyDocumentScanLook(data, width, height) {
       sat = getSaturation(r, g, b);
     }
 
-    const inkTarget = [18, 18, 20];
-    const inkWeight = (1 - smoothstep(82, 210, nl)) * (1 - smoothstep(18, 44, sat));
-    r = mixChannel(r, inkTarget[0], inkWeight * 0.78);
-    g = mixChannel(g, inkTarget[1], inkWeight * 0.78);
-    b = mixChannel(b, inkTarget[2], inkWeight * 0.78);
+    // CamScanner-style "Ajaib Pro":
+    // 1. Text / Ink: darken to crisp deep contrast
+    const inkTarget = [12, 12, 14];
+    const inkWeight = (1 - smoothstep(75, 195, nl)) * (1 - smoothstep(16, 44, sat));
+    r = mixChannel(r, inkTarget[0], inkWeight * 0.88);
+    g = mixChannel(g, inkTarget[1], inkWeight * 0.88);
+    b = mixChannel(b, inkTarget[2], inkWeight * 0.88);
 
     nl = getLuminance(r, g, b);
 
-    const paperWeight = smoothstep(172, 218, nl) * (1 - smoothstep(16, 38, sat));
-    r = mixChannel(r, paperTone[0], paperWeight * 0.88);
-    g = mixChannel(g, paperTone[1], paperWeight * 0.88);
-    b = mixChannel(b, paperTone[2], paperWeight * 0.88);
+    // 2. Paper background: clean white
+    const paperWeight = smoothstep(160, 215, nl) * (1 - smoothstep(15, 38, sat));
+    r = mixChannel(r, paperTone[0], paperWeight * 0.98);
+    g = mixChannel(g, paperTone[1], paperWeight * 0.98);
+    b = mixChannel(b, paperTone[2], paperWeight * 0.98);
 
     data[i] = r;
     data[i + 1] = g;
@@ -1155,11 +1391,12 @@ export async function applyEnhanceFilter(dataUrl) {
 
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   applyColorClarity(imageData.data, canvas.width, canvas.height);
+  applySharpen(imageData.data, canvas.width, canvas.height, 0.4);
   ctx.putImageData(imageData, 0, 0);
   return canvasToDataUrl(canvas, dataUrl, { lossless: false });
 }
 
-function applySharpen(data, width, height, amount = 0.45) {
+function applySharpen(data, width, height, amount = 0.4) {
   const copy = new Uint8ClampedArray(data);
   const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
 
@@ -1186,11 +1423,46 @@ function clampByte(value) {
   return Math.max(0, Math.min(255, Math.round(value)));
 }
 
+const A4_RATIO = 210 / 297;
+const A4_LONG_EDGE = 1754;
+
+/** Sesuaikan dokumen ke kanvas A4 (portrait/landscape) seperti CamScanner. */
+export async function fitToA4Page(dataUrl, options = {}) {
+  const { marginRatio = 0.028, paper = [254, 254, 252] } = options;
+  const img = await loadImage(dataUrl);
+  const srcW = img.naturalWidth;
+  const srcH = img.naturalHeight;
+  const portrait = srcH >= srcW;
+  const pageW = portrait ? Math.round(A4_LONG_EDGE * A4_RATIO) : A4_LONG_EDGE;
+  const pageH = portrait ? A4_LONG_EDGE : Math.round(A4_LONG_EDGE * A4_RATIO);
+  const margin = Math.round(Math.min(pageW, pageH) * marginRatio);
+  const innerW = pageW - margin * 2;
+  const innerH = pageH - margin * 2;
+  const scale = Math.min(innerW / srcW, innerH / srcH);
+  const drawW = Math.max(1, Math.round(srcW * scale));
+  const drawH = Math.max(1, Math.round(srcH * scale));
+  const drawX = Math.round((pageW - drawW) / 2);
+  const drawY = Math.round((pageH - drawH) / 2);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = pageW;
+  canvas.height = pageH;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = `rgb(${paper.join(',')})`;
+  ctx.fillRect(0, 0, pageW, pageH);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, drawX, drawY, drawW, drawH);
+
+  return canvasToDataUrl(canvas, dataUrl, { lossless: true });
+}
+
 export async function buildProcessedImage(item, cropRect, enhanceEnabled) {
   const sourceUrl = item.scanBaseDataUrl || item.originalDataUrl;
   const dims = await getImageDimensions(sourceUrl);
   const rect = cropRect ?? fullCropRect(dims.width, dims.height);
   const baseDataUrl = await cropImage(sourceUrl, rect, { lossless: true });
+
   const dataUrl = enhanceEnabled ? await applyEnhanceFilter(baseDataUrl) : baseDataUrl;
 
   return { baseDataUrl, dataUrl, cropRect: rect };
@@ -1223,6 +1495,7 @@ export async function rapikanImage(originalDataUrl, enhanceEnabled = false) {
     enhanceEnabled,
     autoEnhanceApplied: enhanceEnabled,
     dataUrl,
+    geminiError: getLastGeminiError(),
   };
 }
 
@@ -1235,14 +1508,21 @@ export async function autoTidyImage(originalDataUrl, options = {}) {
 }
 
 export async function processUploadedImage(_file, originalDataUrl) {
+  try {
+    const result = await autoTidyImage(originalDataUrl, { autoCrop: true, autoEnhance: true });
+    if (isRapikanDone(result)) return result;
+  } catch (err) {
+    console.warn('Auto scan gagal:', err);
+  }
   return prepareUploadedImage(originalDataUrl);
 }
 
 export function isRapikanDone(item) {
   return !!(
-    item.autoCropApplied &&
-    item.scanBaseDataUrl &&
-    item.scanBaseDataUrl !== item.originalDataUrl
+    item?.autoCropApplied &&
+    item?.scanBaseDataUrl &&
+    (item.scanBaseDataUrl !== item.originalDataUrl ||
+      (item.cropRect && (item.cropRect.x > 0 || item.cropRect.y > 0 || item.cropRect.width > 0)))
   );
 }
 
