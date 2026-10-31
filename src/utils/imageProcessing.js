@@ -2,8 +2,14 @@ import {
   collectCornerCandidates,
   detectCornersFromAnalysis,
   outsetCorners,
+  perspectiveWarpCanvas,
 } from './documentScan.js';
-import { tryOpenCvDocumentWarp } from './opencvDocumentScan.js';
+import { loadOpenCv } from './opencvLoader.js';
+import {
+  refineDocumentCorners,
+  tryOpenCvDocumentWarp,
+  tryOpenCvDocumentWarpDetailed,
+} from './opencvDocumentScan.js';
 import {
   hasGeminiApiKey,
   detectDocumentCornersWithGemini,
@@ -609,16 +615,51 @@ async function detectDocumentCornersFromDataUrl(dataUrl, maxSize = 1200) {
   return sets[0]?.corners ?? null;
 }
 
+async function measureResidualSkew(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const maxDim = 420;
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, width, height);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const gray = new Float32Array(width * height);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = getLuminance(data[i], data[i + 1], data[i + 2]);
+  }
+  return Math.abs(estimateDocumentSkewAngle(gray, width, height));
+}
+
 async function measureWarpBorderQuality(dataUrl) {
-  const { gray, width, height } = await analyzeImageGray(dataUrl);
-  const strip = Math.max(3, Math.round(Math.min(width, height) * 0.012));
+  const img = await loadImage(dataUrl);
+  const maxDim = 700;
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, width, height);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const strip = Math.max(3, Math.round(Math.min(width, height) * 0.018));
   let nonPaper = 0;
   let total = 0;
-  /* Relaxed from 118 — warped edges often have shadow/color artefacts */
-  const paperCutoff = 95;
 
   const sample = (x, y) => {
-    if (gray[y * width + x] < paperCutoff) nonPaper++;
+    const i = (y * width + x) * 4;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const lum = getLuminance(r, g, b);
+    const sat = Math.max(r, g, b) - Math.min(r, g, b);
+    const coloredBackground = sat > 46 && lum > 60;
+    const darkBackground = lum < 100;
+    if (coloredBackground || darkBackground) nonPaper++;
     total++;
   };
 
@@ -643,9 +684,9 @@ async function scorePerspectivePackage(packaged, originalDataUrl) {
   const warpedArea = warped.width * warped.height;
   const areaRatio = warpedArea / origArea;
 
-  if (areaRatio > 1.06 || areaRatio < 0.06) return -1;
-  /* Relaxed from 0.28 — paper may occupy a smaller portion of the photo */
-  if (areaRatio < 0.12) return -1;
+  if (areaRatio > 1.06 || areaRatio < 0.05) return -1;
+  /* Struk/kertas kecil di foto atau screenshot galeri boleh lebih kecil dari halaman A4 */
+  if (areaRatio < 0.07) return -1;
 
   const cropFill =
     (packaged.cropRect.width * packaged.cropRect.height) / (warped.width * warped.height);
@@ -653,24 +694,38 @@ async function scorePerspectivePackage(packaged, originalDataUrl) {
   if (cropFill < 0.15) return -1;
 
   const borderQuality = await measureWarpBorderQuality(packaged.scanBaseDataUrl);
+  const skew = await measureResidualSkew(packaged.scanBaseDataUrl);
+  const skewFactor = skew <= 2 ? 1 : skew >= 12 ? 0.12 : 1 - ((skew - 2) / 10) * 0.88;
   const aspect = warped.width / Math.max(1, warped.height);
   const aspectScore =
-    aspect >= 0.48 && aspect <= 0.82
-      ? 1 - Math.abs(aspect - 0.68) / 0.34
-      : aspect > 0.82
-        ? Math.max(0, 0.35 - (aspect - 0.82) * 1.4)
-        : Math.max(0, aspect / 0.48);
+    aspect >= 0.28 && aspect <= 0.92
+      ? 1 - Math.abs(aspect - 0.62) / 0.7
+      : aspect > 0.92
+        ? Math.max(0, 0.35 - (aspect - 0.92) * 1.2)
+        : Math.max(0, aspect / 0.28);
 
   const areaBell =
-    areaRatio >= 0.38 && areaRatio <= 0.82
-      ? 1 - Math.abs(areaRatio - 0.58) / 0.44
-      : Math.max(0, 0.45 - Math.abs(areaRatio - 0.58) * 0.6);
+    areaRatio >= 0.12 && areaRatio <= 0.86
+      ? 1 - Math.abs(areaRatio - 0.42) / 0.74
+      : Math.max(0, 0.35 - Math.abs(areaRatio - 0.42) * 0.5);
 
-  return cropFill * 0.46 + borderQuality * 0.24 + aspectScore * 0.18 + areaBell * 0.12;
+  const spill = await warmEdgeSpill(packaged.scanBaseDataUrl);
+  const spillFactor = Math.max(0.18, 1 - spill * 1.4);
+  const base =
+    cropFill * 0.28 +
+    borderQuality * 0.34 +
+    aspectScore * 0.12 +
+    areaBell * 0.1 +
+    skewFactor * 0.16;
+
+  return base * spillFactor * (skew >= 10 ? 0.4 : 1) * (borderQuality < 0.55 ? 0.45 : 1);
 }
 
-async function tryWarpWithCorners(originalDataUrl, corners) {
+async function tryWarpWithCorners(originalDataUrl, roughCorners) {
   const candidates = [];
+  const { corners, confident } = await refineDocumentCorners(originalDataUrl, roughCorners);
+  /* Tepi kertas terkunci → hasil warp sudah pas, trim hanya akan memakan isi tepi */
+  const packageWarp = confident ? packageRefinedWarp : packageWarpResult;
 
   const addCandidate = async (packaged) => {
     if (!packaged) return;
@@ -684,12 +739,15 @@ async function tryWarpWithCorners(originalDataUrl, corners) {
       20000,
       'OpenCV rapikan',
     );
-    if (opencvWarped) await addCandidate(await packageWarpResult(opencvWarped));
+    if (opencvWarped) await addCandidate(await packageWarp(opencvWarped));
   } catch (err) {
     console.warn('OpenCV rapikan gagal:', err);
   }
 
-  await addCandidate(await tryCanvasPerspectiveWarp(originalDataUrl, corners));
+  const canvasPack = await tryCanvasPerspectiveWarp(originalDataUrl, corners);
+  if (canvasPack?.scanBaseDataUrl) {
+    await addCandidate(confident ? canvasPack : await finishStraightScan(canvasPack.scanBaseDataUrl));
+  }
 
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.score - a.score);
@@ -697,31 +755,32 @@ async function tryWarpWithCorners(originalDataUrl, corners) {
 }
 
 async function tryPerspectiveWarp(originalDataUrl) {
-  const cornerSets = await detectAllCornerCandidateSets(originalDataUrl, 1200);
   const tried = [];
 
+  try {
+    const opencvAuto = await withTimeout(
+      tryOpenCvDocumentWarpDetailed(originalDataUrl, 2400),
+      20000,
+      'OpenCV auto rapikan',
+    );
+    if (opencvAuto) {
+      const packageWarp = opencvAuto.confident ? packageRefinedWarp : packageWarpResult;
+      const packaged = await packageWarp(opencvAuto.dataUrl);
+      const score = await scorePerspectivePackage(packaged, originalDataUrl);
+      /* Tepi kertas terkunci & skor meyakinkan → lewati kandidat cadangan (hemat ±5–7 detik) */
+      if (opencvAuto.confident && (score >= 0.6 || opencvAuto.score >= 0.8)) return packaged;
+      if (score > 0) tried.push({ result: packaged, score });
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const cornerSets = await detectAllCornerCandidateSets(originalDataUrl, 1200);
   for (const { corners } of cornerSets.slice(0, 5)) {
     const result = await tryWarpWithCorners(originalDataUrl, corners);
     if (!result) continue;
     const score = await scorePerspectivePackage(result, originalDataUrl);
     if (score > 0) tried.push({ result, score });
-  }
-
-  if (tried.length === 0) {
-    try {
-      const opencvAuto = await withTimeout(
-        tryOpenCvDocumentWarp(originalDataUrl, 2400),
-        20000,
-        'OpenCV auto rapikan',
-      );
-      if (opencvAuto) {
-        const packaged = await packageWarpResult(opencvAuto);
-        const score = await scorePerspectivePackage(packaged, originalDataUrl);
-        if (score > 0) tried.push({ result: packaged, score });
-      }
-    } catch {
-      /* ignore */
-    }
   }
 
   if (tried.length === 0) return null;
@@ -738,14 +797,7 @@ export async function warpWithExactCorners(originalDataUrl, corners) {
       'OpenCV exact warp',
     );
     if (opencvWarped) {
-      const dims = await getImageDimensions(opencvWarped);
-      const full = fullCropRect(dims.width, dims.height);
-      return {
-        scanBaseDataUrl: opencvWarped,
-        cropRect: full,
-        autoCropRect: full,
-        autoCropApplied: true,
-      };
+      return finishStraightScan(opencvWarped);
     }
   } catch (err) {
     console.warn('OpenCV exact warp gagal, beralih ke canvas:', err);
@@ -754,7 +806,7 @@ export async function warpWithExactCorners(originalDataUrl, corners) {
   try {
     const canvasWarped = await tryCanvasPerspectiveWarp(originalDataUrl, corners);
     if (canvasWarped) {
-      return canvasWarped;
+      return finishStraightScan(canvasWarped.scanBaseDataUrl);
     }
   } catch (err) {
     console.warn('Canvas exact warp gagal:', err);
@@ -766,29 +818,54 @@ export async function warpWithExactCorners(originalDataUrl, corners) {
 export async function tryGeminiDocumentWarp(originalDataUrl) {
   if (!hasGeminiApiKey()) return null;
 
+  /* Deteksi lokal jalan paralel selama menunggu Gemini */
+  const localPromise = withTimeout(
+    tryOpenCvDocumentWarpDetailed(originalDataUrl, 2400),
+    20000,
+    'OpenCV lokal (Gemini)',
+  ).catch(() => null);
+
+  const geminiPromise = detectDocumentCornersWithGemini(originalDataUrl);
+  geminiPromise.catch(() => {});
+
   try {
-    const aiResult = await detectDocumentCornersWithGemini(originalDataUrl);
+    /* Request Gemini tidak punya timeout & mencoba beberapa model berurutan.
+       Bila tepi kertas lokal sudah meyakinkan, Gemini cukup ditunggu sebentar (hanya untuk rotasi). */
+    const local = await localPromise;
+    const preciseLocal = local?.confident ? local : null;
+    let aiResult;
+    try {
+      aiResult = await withTimeout(geminiPromise, preciseLocal ? 4000 : 12000, 'Gemini');
+    } catch (err) {
+      if (!preciseLocal) throw err;
+      console.warn('Gemini lambat/gagal, pakai hasil deteksi lokal:', err.message);
+      return { ...(await packageRefinedWarp(preciseLocal.dataUrl)), detectedCorners: preciseLocal.corners };
+    }
     if (!aiResult?.corners || aiResult.corners.length !== 4) return null;
 
-    let warped = await warpWithExactCorners(originalDataUrl, aiResult.corners);
+    /* Sudut Gemini cuma perkiraan kasar: pakai tepi kertas lokal bila meyakinkan,
+       kalau tidak presisikan sudut Gemini ke tepi kertas. Rotasi tetap dari Gemini. */
+    let corners;
+    let warped;
+    if (preciseLocal) {
+      corners = preciseLocal.corners;
+      warped = await packageRefinedWarp(preciseLocal.dataUrl);
+    } else {
+      ({ corners } = await refineDocumentCorners(originalDataUrl, aiResult.corners));
+      warped = await warpWithExactCorners(originalDataUrl, corners);
+    }
     if (!warped) return null;
 
-    if (aiResult.rotation && [90, 180, 270].includes(aiResult.rotation)) {
-      const rotatedUrl = await rotateDataUrl(warped.scanBaseDataUrl, aiResult.rotation);
-      const rDims = await getImageDimensions(rotatedUrl);
-      const rFull = fullCropRect(rDims.width, rDims.height);
-      warped = {
-        ...warped,
-        scanBaseDataUrl: rotatedUrl,
-        cropRect: rFull,
-        autoCropRect: rFull,
-      };
+    const rotation = ((Math.round(Number(aiResult.rotation) || 0) % 360) + 360) % 360;
+    if (rotation === 90 || rotation === 180 || rotation === 270) {
+      const rotatedUrl = await rotateDataUrl(warped.scanBaseDataUrl, rotation);
+      warped = preciseLocal ? await packageRefinedWarp(rotatedUrl) : await finishStraightScan(rotatedUrl);
     }
 
     return {
       ...warped,
       usedGeminiAi: true,
-      detectedCorners: aiResult.corners,
+      detectedCorners: corners,
       model: aiResult.model,
     };
   } catch (err) {
@@ -836,7 +913,7 @@ function estimateDocumentSkewAngle(gray, width, height) {
 
   let bestAngle = 0;
   let bestScore = -1;
-  for (let angle = -9; angle <= 9; angle += 0.35) {
+  for (let angle = -14; angle <= 14; angle += 0.35) {
     const score = skewProjectionScore(binary, width, height, angle);
     if (score > bestScore) {
       bestScore = score;
@@ -928,8 +1005,233 @@ async function deskewDocumentImage(dataUrl) {
   return trimmed.dataUrl;
 }
 
+function isWarmTablePixel(r, g, b) {
+  const sat = Math.max(r, g, b) - Math.min(r, g, b);
+  const lum = getLuminance(r, g, b);
+  return sat > 48 && r > b + 30 && g > b + 8 && lum > 70 && lum < 240;
+}
+
+async function readImagePixels(dataUrl, maxDim = 900) {
+  const img = await loadImage(dataUrl);
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, width, height);
+  return { data: ctx.getImageData(0, 0, width, height).data, width, height, scale };
+}
+
+async function trimColoredMargins(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const width = img.naturalWidth;
+  const height = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const { data } = ctx.getImageData(0, 0, width, height);
+
+  const rowWarm = (y) => {
+    let warm = 0;
+    const x0 = Math.round(width * 0.1);
+    const x1 = Math.round(width * 0.9);
+    for (let x = x0; x <= x1; x++) {
+      const i = (y * width + x) * 4;
+      if (isWarmTablePixel(data[i], data[i + 1], data[i + 2])) warm++;
+    }
+    return warm / (x1 - x0 + 1);
+  };
+
+  const colWarm = (x) => {
+    let warm = 0;
+    const y0 = Math.round(height * 0.08);
+    const y1 = Math.round(height * 0.92);
+    for (let y = y0; y <= y1; y++) {
+      const i = (y * width + x) * 4;
+      if (isWarmTablePixel(data[i], data[i + 1], data[i + 2])) warm++;
+    }
+    return warm / (y1 - y0 + 1);
+  };
+
+  let minY = 0;
+  let maxY = height - 1;
+  let minX = 0;
+  let maxX = width - 1;
+  while (minY < height * 0.18 && rowWarm(minY) > 0.32) minY++;
+  while (maxY > height * 0.82 && rowWarm(maxY) > 0.32) maxY--;
+  while (minX < width * 0.22 && colWarm(minX) > 0.28) minX++;
+  while (maxX > width * 0.78 && colWarm(maxX) > 0.28) maxX--;
+
+  if (minX === 0 && minY === 0 && maxX === width - 1 && maxY === height - 1) return dataUrl;
+  if (maxX - minX < 40 || maxY - minY < 40) return dataUrl;
+
+  return cropImage(
+    dataUrl,
+    { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+    { lossless: true },
+  );
+}
+
+async function warmEdgeSpill(dataUrl) {
+  const { data, width, height } = await readImagePixels(dataUrl, 640);
+  const band = Math.max(4, Math.round(Math.min(width, height) * 0.16));
+  let warm = 0;
+  let total = 0;
+
+  const sample = (x, y) => {
+    const i = (y * width + x) * 4;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const lum = getLuminance(r, g, b);
+    const sat = Math.max(r, g, b) - Math.min(r, g, b);
+    if (lum > 248 && sat < 12) return;
+    total++;
+    if (isWarmTablePixel(r, g, b)) warm++;
+  };
+
+  for (let y = 0; y < height; y++) {
+    const inBandY = y < band || y >= height - band;
+    for (let x = 0; x < width; x++) {
+      if (!inBandY && x >= band && x < width - band) continue;
+      sample(x, y);
+    }
+  }
+
+  return total ? warm / total : 0;
+}
+
+async function finishStraightScan(dataUrl) {
+  let trimmed = await trimDocumentEdges(await trimColoredMargins(dataUrl));
+  trimmed = {
+    ...trimmed,
+    dataUrl: await deskewDocumentImage(trimmed.dataUrl),
+  };
+  const dims = await getImageDimensions(trimmed.dataUrl);
+  const full = fullCropRect(dims.width, dims.height);
+  return {
+    scanBaseDataUrl: trimmed.dataUrl,
+    cropRect: full,
+    autoCropRect: full,
+    autoCropApplied: true,
+  };
+}
+
+/**
+ * Cat sisa latar (berwarna/gelap) yang menempel di pinggir hasil warp dengan warna kertas.
+ * Hanya piksel yang terhubung ke tepi gambar dan berada di pita tepi — isi dokumen tidak disentuh,
+ * dimensi gambar tidak berubah.
+ */
+async function paintEdgeBackground(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const width = img.naturalWidth;
+  const height = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const { data } = imageData;
+
+  /* Warna kertas acuan: rata-rata piksel terang & netral di area tengah */
+  const paper = [0, 0, 0];
+  let paperCount = 0;
+  const lums = [];
+  for (let y = Math.floor(height * 0.2); y < height * 0.8; y += 3) {
+    for (let x = Math.floor(width * 0.2); x < width * 0.8; x += 3) {
+      const i = (y * width + x) * 4;
+      if (getSaturation(data[i], data[i + 1], data[i + 2]) < 30) {
+        lums.push(getLuminance(data[i], data[i + 1], data[i + 2]));
+      }
+    }
+  }
+  lums.sort((a, b) => a - b);
+  const paperLum = lums.length ? lums[Math.floor(lums.length * 0.8)] : 220;
+  for (let y = Math.floor(height * 0.2); y < height * 0.8; y += 3) {
+    for (let x = Math.floor(width * 0.2); x < width * 0.8; x += 3) {
+      const i = (y * width + x) * 4;
+      const lum = getLuminance(data[i], data[i + 1], data[i + 2]);
+      if (lum >= paperLum - 10 && getSaturation(data[i], data[i + 1], data[i + 2]) < 30) {
+        paper[0] += data[i];
+        paper[1] += data[i + 1];
+        paper[2] += data[i + 2];
+        paperCount++;
+      }
+    }
+  }
+  if (!paperCount) return dataUrl;
+  for (let c = 0; c < 3; c++) paper[c] = Math.round(paper[c] / paperCount);
+
+  const isBackground = (p) => {
+    const i = p * 4;
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    /* Latar berwarna, atau jauh lebih gelap dari kertas (meja/lantai abu-abu, bayangan tepi) */
+    return getSaturation(r, g, b) > 45 || getLuminance(r, g, b) < paperLum - 45;
+  };
+
+  const band = Math.max(4, Math.round(Math.min(width, height) * 0.025));
+  const inBand = (x, y) => x < band || y < band || x >= width - band || y >= height - band;
+  const visited = new Uint8Array(width * height);
+  const stack = [];
+  const seed = (x, y) => {
+    const p = y * width + x;
+    if (!visited[p] && isBackground(p)) {
+      visited[p] = 1;
+      stack.push(p);
+    }
+  };
+  for (let x = 0; x < width; x++) {
+    seed(x, 0);
+    seed(x, height - 1);
+  }
+  for (let y = 0; y < height; y++) {
+    seed(0, y);
+    seed(width - 1, y);
+  }
+
+  let painted = 0;
+  while (stack.length) {
+    const p = stack.pop();
+    const i = p * 4;
+    data[i] = paper[0];
+    data[i + 1] = paper[1];
+    data[i + 2] = paper[2];
+    painted++;
+    const x = p % width;
+    const y = (p - x) / width;
+    for (const [nx, ny] of [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]]) {
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height || !inBand(nx, ny)) continue;
+      seed(nx, ny);
+    }
+  }
+
+  if (!painted) return dataUrl;
+  ctx.putImageData(imageData, 0, 0);
+  return canvasToDataUrl(canvas, dataUrl, { lossless: true });
+}
+
+/** Sudut sudah dipresisikan ke tepi kertas: jangan trim/crop lagi agar isi di tepi tidak hilang. */
+async function packageRefinedWarp(rawWarped) {
+  const warped = await paintEdgeBackground(rawWarped);
+  const dims = await getImageDimensions(warped);
+  const full = fullCropRect(dims.width, dims.height);
+  return {
+    scanBaseDataUrl: warped,
+    cropRect: full,
+    autoCropRect: full,
+    autoCropApplied: true,
+  };
+}
+
 async function packageWarpResult(warped) {
-  let trimmed = await trimDocumentEdges(warped);
+  let trimmed = await trimDocumentEdges(await trimColoredMargins(warped));
   trimmed = {
     ...trimmed,
     dataUrl: await deskewDocumentImage(trimmed.dataUrl),
@@ -996,6 +1298,7 @@ async function tryCanvasPerspectiveWarp(originalDataUrl, presetCorners = null) {
     y: point.y * renderScale,
   }));
 
+  const warped = perspectiveWarpCanvas(canvas, renderCorners, originalDataUrl, 2400);
   if (!warped) return null;
 
   if (presetCorners) {
@@ -1381,17 +1684,245 @@ function applyColorClarity(data, width, height) {
   applyDocumentScanLook(data, width, height);
 }
 
+/**
+ * Taksir latar kertas per kanal (teks dihapus lewat close, lalu dihaluskan) di resolusi kecil,
+ * dikembalikan dalam ukuran `width`×`height` sebagai RGBA per piksel.
+ */
+function estimatePaperBackground(cv, img, width, height) {
+  const scale = Math.min(1, 480 / Math.max(width, height));
+  const smallCanvas = document.createElement('canvas');
+  smallCanvas.width = Math.max(1, Math.round(width * scale));
+  smallCanvas.height = Math.max(1, Math.round(height * scale));
+  smallCanvas.getContext('2d').drawImage(img, 0, 0, smallCanvas.width, smallCanvas.height);
+  const small = cv.imread(smallCanvas);
+
+  /* Close (dilasi→erosi): teks hilang, batas bayangan tetap di tempatnya.
+     Kernel > tebal goresan teks, < lebar bayangan/gradasi. */
+  const k = Math.max(5, Math.round(Math.min(small.cols, small.rows) * 0.025)) | 1;
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(k, k));
+  const bg = new cv.Mat();
+  cv.morphologyEx(small, bg, cv.MORPH_CLOSE, kernel);
+  const blur = Math.max(3, Math.round(k / 2)) | 1;
+  cv.GaussianBlur(bg, bg, new cv.Size(blur, blur), 0);
+  /* Perbesar ke ukuran penuh lewat canvas (GPU) — jauh lebih cepat dari cv.resize + salin */
+  const bgCanvas = document.createElement('canvas');
+  cv.imshow(bgCanvas, bg);
+  kernel.delete();
+  small.delete();
+  bg.delete();
+  const fullCanvas = document.createElement('canvas');
+  fullCanvas.width = width;
+  fullCanvas.height = height;
+  const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
+  fullCtx.imageSmoothingEnabled = true;
+  fullCtx.imageSmoothingQuality = 'high';
+  fullCtx.drawImage(bgCanvas, 0, 0, width, height);
+  return fullCtx.getImageData(0, 0, width, height).data;
+}
+
+/**
+ * Filter "Ajaib" ala CamScanner: normalisasi latar (bayangan & gradasi hilang, kertas putih rata)
+ * lalu kurva tone — tinta hitam pekat tanpa ambang biner, jadi tepi huruf & teks kecil tetap utuh.
+ * Tinta berwarna (logo, stempel) tetap berwarna.
+ */
+/** Hasil foto HP (±1000 px) diperbesar sampai sisi panjang ini agar teks halus & tajam di PDF. */
+const ENHANCE_LONG_EDGE = 2000;
+
+/**
+ * Unsharp mask pada kecerahan saja (box blur 2× ≈ gaussian, O(n)): tepi huruf lebih tegas
+ * tanpa menggeser warna. GaussianBlur OpenCV pada RGBA ukuran HD terlalu lambat di wasm.
+ */
+function applyUnsharpMask(data, width, height, radius, amount) {
+  const lum = new Float32Array(width * height);
+  for (let p = 0, i = 0; p < lum.length; p++, i += 4) {
+    lum[p] = getLuminance(data[i], data[i + 1], data[i + 2]);
+  }
+  const blurred = boxBlur(boxBlur(lum, width, height, radius), width, height, radius);
+  for (let p = 0, i = 0; p < lum.length; p++, i += 4) {
+    const detail = (lum[p] - blurred[p]) * amount;
+    if (detail === 0) continue;
+    data[i] = clampByte(data[i] + detail);
+    data[i + 1] = clampByte(data[i + 1] + detail);
+    data[i + 2] = clampByte(data[i + 2] + detail);
+  }
+}
+
+/**
+ * Setelah filter, kertas sudah putih rata — apa pun yang gelap/berwarna, menyambung ke tepi
+ * gambar dan berada di pita tepi adalah sisa tepi kertas (melengkung/terlipat) atau latar.
+ * Diputihkan agar pinggir hasil bersih seperti hasil scanner.
+ */
+function whitenScanBorder(data, width, height) {
+  const band = Math.max(4, Math.round(Math.min(width, height) * 0.03));
+  const isDirty = (p) => {
+    const i = p * 4;
+    return (
+      getLuminance(data[i], data[i + 1], data[i + 2]) < 215 ||
+      getSaturation(data[i], data[i + 1], data[i + 2]) > 40
+    );
+  };
+  const inBand = (x, y) => x < band || y < band || x >= width - band || y >= height - band;
+  const visited = new Uint8Array(width * height);
+  const stack = [];
+  const seed = (x, y) => {
+    const p = y * width + x;
+    if (!visited[p] && isDirty(p)) {
+      visited[p] = 1;
+      stack.push(p);
+    }
+  };
+  for (let x = 0; x < width; x++) {
+    seed(x, 0);
+    seed(x, height - 1);
+  }
+  for (let y = 0; y < height; y++) {
+    seed(0, y);
+    seed(width - 1, y);
+  }
+  while (stack.length) {
+    const p = stack.pop();
+    const i = p * 4;
+    data[i] = 255;
+    data[i + 1] = 255;
+    data[i + 2] = 255;
+    const x = p % width;
+    const y = (p - x) / width;
+    if (x + 1 < width && inBand(x + 1, y)) seed(x + 1, y);
+    if (x > 0 && inBand(x - 1, y)) seed(x - 1, y);
+    if (y + 1 < height && inBand(x, y + 1)) seed(x, y + 1);
+    if (y > 0 && inBand(x, y - 1)) seed(x, y - 1);
+  }
+
+  /* Garis gelap panjang & tipis yang terpisah dari tepi (bekas tepi/pojok kertas melengkung):
+     komponen di pita tepi yang panjang tapi isinya jarang. Huruf kecil & padat, tidak kena. */
+  const minLength = Math.min(width, height) * 0.03;
+  const seen = new Uint8Array(width * height);
+  const isInk = (i) => getLuminance(data[i], data[i + 1], data[i + 2]) < 200;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!inBand(x, y)) {
+        x = width - band - 1;
+        continue;
+      }
+      const start = y * width + x;
+      if (seen[start] || !isInk(start * 4)) continue;
+      const component = [start];
+      seen[start] = 1;
+      let minX = x;
+      let maxX = x;
+      let minY = y;
+      let maxY = y;
+      for (let k = 0; k < component.length; k++) {
+        const p = component[k];
+        const px = p % width;
+        const py = (p - px) / width;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        for (const [nx, ny] of [[px + 1, py], [px - 1, py], [px, py + 1], [px, py - 1]]) {
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height || !inBand(nx, ny)) continue;
+          const q = ny * width + nx;
+          if (seen[q] || !isInk(q * 4)) continue;
+          seen[q] = 1;
+          component.push(q);
+        }
+      }
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      if (Math.max(boxW, boxH) < minLength || component.length / (boxW * boxH) >= 0.2) continue;
+      for (const p of component) {
+        data[p * 4] = 255;
+        data[p * 4 + 1] = 255;
+        data[p * 4 + 2] = 255;
+      }
+    }
+  }
+
+  /* Garis abu-abu terang di pita tepi (bekas tepi kertas melengkung) — tinta asli jauh lebih gelap */
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!inBand(x, y)) {
+        x = width - band - 1;
+        continue;
+      }
+      const i = (y * width + x) * 4;
+      /* Makin dekat ke tepi, makin agresif: sisa lengkungan kertas berupa garis putus-putus abu-abu */
+      const edgeDist = Math.min(x, y, width - 1 - x, height - 1 - y);
+      const minLum = edgeDist < band * 0.6 ? 110 : 160;
+      if (
+        getLuminance(data[i], data[i + 1], data[i + 2]) >= minLum &&
+        getSaturation(data[i], data[i + 1], data[i + 2]) <= 40
+      ) {
+        data[i] = 255;
+        data[i + 1] = 255;
+        data[i + 2] = 255;
+      }
+    }
+  }
+}
+
 export async function applyEnhanceFilter(dataUrl) {
   const img = await loadImage(dataUrl);
+  const upscale = Math.min(2.5, ENHANCE_LONG_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+  const scale = upscale > 1.05 ? upscale : 1;
   const canvas = document.createElement('canvas');
-  canvas.width = img.naturalWidth;
-  canvas.height = img.naturalHeight;
+  canvas.width = Math.round(img.naturalWidth * scale);
+  canvas.height = Math.round(img.naturalHeight * scale);
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0);
-
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  applyColorClarity(imageData.data, canvas.width, canvas.height);
-  applySharpen(imageData.data, canvas.width, canvas.height, 0.4);
+  const { data } = imageData;
+
+  let cv = null;
+  let background = null;
+  try {
+    cv = await loadOpenCv();
+    background = estimatePaperBackground(cv, img, canvas.width, canvas.height);
+  } catch (err) {
+    console.warn('Filter Ajaib: OpenCV tidak tersedia, pakai filter lama:', err);
+  }
+
+  if (!background) {
+    applyColorClarity(data, canvas.width, canvas.height);
+    applySharpen(data, canvas.width, canvas.height, 0.3);
+    ctx.putImageData(imageData, 0, 0);
+    return canvasToDataUrl(canvas, dataUrl, { lossless: false });
+  }
+
+  /* Piksel netral (teks hitam, kertas): kurva curam pada kecerahan — kertas putih, tinta
+     tipis/kecil pekat. Piksel berwarna (stempel, logo, foto): cukup dinormalisasi terhadap
+     latar agar warnanya tetap wajar, tidak dihitamkan. Keduanya dicampur sesuai kadar warna. */
+  const black = 0.25;
+  const white = 0.92;
+  const gamma = 2.2;
+  const colorBoost = 1.6;
+  for (let i = 0; i < data.length; i += 4) {
+    const nr = Math.min(1.1, data[i] / Math.max(40, background[i]));
+    const ng = Math.min(1.1, data[i + 1] / Math.max(40, background[i + 1]));
+    const nb = Math.min(1.1, data[i + 2] / Math.max(40, background[i + 2]));
+    const lum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
+    const t = Math.max(0, Math.min(1, (lum - black) / (white - black)));
+    const inkLum = 255 * Math.pow(t, gamma);
+    const chroma = Math.max(nr, ng, nb) - Math.min(nr, ng, nb);
+    const colorWeight = Math.min(1, Math.max(0, (chroma - 0.06) / 0.12));
+    if (colorWeight === 0) {
+      data[i] = data[i + 1] = data[i + 2] = Math.round(inkLum);
+      continue;
+    }
+    /* Warna dinormalisasi + saturasi dinaikkan sedang (foto HP cenderung kusam) */
+    const colorLum = (255 * lum) / white;
+    const r = colorLum + (nr - lum) * 255 * colorBoost;
+    const g = colorLum + (ng - lum) * 255 * colorBoost;
+    const bl = colorLum + (nb - lum) * 255 * colorBoost;
+    data[i] = clampByte(inkLum + (r - inkLum) * colorWeight);
+    data[i + 1] = clampByte(inkLum + (g - inkLum) * colorWeight);
+    data[i + 2] = clampByte(inkLum + (bl - inkLum) * colorWeight);
+  }
+  applyUnsharpMask(data, canvas.width, canvas.height, Math.max(1, Math.round(scale)), 0.7);
+  whitenScanBorder(data, canvas.width, canvas.height);
   ctx.putImageData(imageData, 0, 0);
   return canvasToDataUrl(canvas, dataUrl, { lossless: false });
 }
